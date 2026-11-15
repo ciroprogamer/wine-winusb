@@ -1,0 +1,5 @@
+# Let Wine (libusb) open Huawei phones and Android fastboot/adb devices.
+# Huawei / Honor
+SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0666", TAG+="uaccess"
+# Google vendor ID, used by fastboot mode (18d1:d00d) and many adb devices
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", TAG+="uaccess"

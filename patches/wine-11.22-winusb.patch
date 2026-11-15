@@ -1,0 +1,2533 @@
+diff --git a/configure.ac b/configure.ac
+index afcdd85..a6f68a4 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3371,6 +3371,7 @@ WINE_CONFIG_MAKEFILE(dlls/wintrust)
+ WINE_CONFIG_MAKEFILE(dlls/wintrust/tests)
+ WINE_CONFIG_MAKEFILE(dlls/wintypes)
+ WINE_CONFIG_MAKEFILE(dlls/wintypes/tests)
++WINE_CONFIG_MAKEFILE(dlls/winusb.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winusb)
+ WINE_CONFIG_MAKEFILE(dlls/wkscli)
+ WINE_CONFIG_MAKEFILE(dlls/wlanapi)
+diff --git a/dlls/wineusb.sys/unixlib.c b/dlls/wineusb.sys/unixlib.c
+index 1d6c646..b80622a 100644
+--- a/dlls/wineusb.sys/unixlib.c
++++ b/dlls/wineusb.sys/unixlib.c
+@@ -332,6 +332,10 @@ struct transfer_ctx
+     void *transfer_buffer;
+ };
+ 
++/* Protects irp->Tail.Overlay.DriverContext[0] (the libusb transfer) against
++ * concurrent cancellation while the transfer is being completed and freed. */
++static pthread_mutex_t transfer_mutex = PTHREAD_MUTEX_INITIALIZER;
++
+ static void LIBUSB_CALL transfer_cb(struct libusb_transfer *transfer)
+ {
+     struct transfer_ctx *transfer_ctx = transfer->user_data;
+@@ -342,6 +346,10 @@ static void LIBUSB_CALL transfer_cb(struct libusb_transfer *transfer)
+ 
+     TRACE("Completing IRP %p, status %#x.\n", irp, transfer->status);
+ 
++    pthread_mutex_lock(&transfer_mutex);
++    irp->Tail.Overlay.DriverContext[0] = NULL;
++    pthread_mutex_unlock(&transfer_mutex);
++
+     free(transfer_ctx);
+     urb->UrbHeader.Status = usbd_status_from_libusb(transfer->status);
+ 
+@@ -372,10 +380,29 @@ static void LIBUSB_CALL transfer_cb(struct libusb_transfer *transfer)
+                 break;
+             }
+ 
++            case URB_FUNCTION_CONTROL_TRANSFER:
++            {
++                struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
++                req->TransferBufferLength = transfer->actual_length;
++                if (libusb_control_transfer_get_setup(transfer)->bmRequestType & LIBUSB_ENDPOINT_IN)
++                    memcpy(transfer_buffer, libusb_control_transfer_get_data(transfer), transfer->actual_length);
++                break;
++            }
++
+             default:
+                 ERR("Unexpected function %#x.\n", urb->UrbHeader.Function);
+         }
+     }
++    else
++    {
++        switch (urb->UrbHeader.Function)
++        {
++            case URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER:
++                /* report partial data, e.g. for cancelled or timed out reads */
++                urb->UrbBulkOrInterruptTransfer.TransferBufferLength = transfer->actual_length;
++                break;
++        }
++    }
+ 
+     event.type = USB_EVENT_TRANSFER_COMPLETE;
+     event.u.completed_irp = irp;
+@@ -413,6 +440,24 @@ static struct pipe get_pipe(HANDLE handle)
+     return u.pipe;
+ }
+ 
++static NTSTATUS submit_failed(URB *urb, IRP *irp, struct libusb_transfer *transfer, int ret)
++{
++    struct transfer_ctx *transfer_ctx = transfer->user_data;
++
++    irp->Tail.Overlay.DriverContext[0] = NULL;
++    free(transfer_ctx);
++    /* also frees the buffer if LIBUSB_TRANSFER_FREE_BUFFER is set */
++    libusb_free_transfer(transfer);
++
++    if (ret == LIBUSB_ERROR_NO_DEVICE)
++    {
++        urb->UrbHeader.Status = USBD_STATUS_DEVICE_GONE;
++        return STATUS_DEVICE_NOT_CONNECTED;
++    }
++    urb->UrbHeader.Status = USBD_STATUS_REQUEST_FAILED;
++    return STATUS_UNSUCCESSFUL;
++}
++
+ static NTSTATUS usb_submit_urb(void *args)
+ {
+     const struct usb_submit_urb_params *params = args;
+@@ -477,7 +522,10 @@ static NTSTATUS usb_submit_urb(void *args)
+             transfer->flags = LIBUSB_TRANSFER_FREE_TRANSFER;
+             ret = libusb_submit_transfer(transfer);
+             if (ret < 0)
++            {
+                 ERR("Failed to submit bulk transfer: %s\n", libusb_strerror(ret));
++                return submit_failed(urb, irp, transfer, ret);
++            }
+ 
+             return STATUS_PENDING;
+         }
+@@ -515,7 +563,10 @@ static NTSTATUS usb_submit_urb(void *args)
+             transfer->flags = LIBUSB_TRANSFER_FREE_BUFFER | LIBUSB_TRANSFER_FREE_TRANSFER;
+             ret = libusb_submit_transfer(transfer);
+             if (ret < 0)
++            {
+                 ERR("Failed to submit GET_DESCRIPTOR transfer: %s\n", libusb_strerror(ret));
++                return submit_failed(urb, irp, transfer, ret);
++            }
+ 
+             return STATUS_PENDING;
+         }
+@@ -588,7 +639,61 @@ static NTSTATUS usb_submit_urb(void *args)
+             transfer->flags = LIBUSB_TRANSFER_FREE_BUFFER | LIBUSB_TRANSFER_FREE_TRANSFER;
+             ret = libusb_submit_transfer(transfer);
+             if (ret < 0)
++            {
+                 ERR("Failed to submit vendor-specific interface transfer: %s\n", libusb_strerror(ret));
++                return submit_failed(urb, irp, transfer, ret);
++            }
++
++            return STATUS_PENDING;
++        }
++
++        case URB_FUNCTION_CONTROL_TRANSFER:
++        {
++            struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
++            struct transfer_ctx *transfer_ctx;
++            unsigned char *buffer;
++            uint16_t length;
++
++            length = req->SetupPacket[6] | (req->SetupPacket[7] << 8);
++            if (length > req->TransferBufferLength)
++                length = req->TransferBufferLength;
++
++            if (!(transfer_ctx = calloc(1, sizeof(*transfer_ctx))))
++                return STATUS_NO_MEMORY;
++            transfer_ctx->irp = irp;
++            transfer_ctx->transfer_buffer = params->transfer_buffer;
++
++            if (!(transfer = libusb_alloc_transfer(0)))
++            {
++                free(transfer_ctx);
++                return STATUS_NO_MEMORY;
++            }
++            irp->Tail.Overlay.DriverContext[0] = transfer;
++
++            if (!(buffer = malloc(LIBUSB_CONTROL_SETUP_SIZE + length)))
++            {
++                free(transfer_ctx);
++                libusb_free_transfer(transfer);
++                return STATUS_NO_MEMORY;
++            }
++
++            memcpy(buffer, req->SetupPacket, 6);
++            buffer[6] = length & 0xff;
++            buffer[7] = length >> 8;
++            if (!(buffer[0] & LIBUSB_ENDPOINT_IN) && length)
++                memcpy(buffer + LIBUSB_CONTROL_SETUP_SIZE, params->transfer_buffer, length);
++
++            TRACE("control transfer %02x %02x %02x%02x %02x%02x %u\n", buffer[0], buffer[1],
++                    buffer[3], buffer[2], buffer[5], buffer[4], length);
++
++            libusb_fill_control_transfer(transfer, handle, buffer, transfer_cb, transfer_ctx, 0);
++            transfer->flags = LIBUSB_TRANSFER_FREE_BUFFER | LIBUSB_TRANSFER_FREE_TRANSFER;
++            ret = libusb_submit_transfer(transfer);
++            if (ret < 0)
++            {
++                ERR("Failed to submit control transfer: %s\n", libusb_strerror(ret));
++                return submit_failed(urb, irp, transfer, ret);
++            }
+ 
+             return STATUS_PENDING;
+         }
+@@ -603,10 +708,17 @@ static NTSTATUS usb_submit_urb(void *args)
+ static NTSTATUS usb_cancel_transfer(void *args)
+ {
+     const struct usb_cancel_transfer_params *params = args;
++    struct libusb_transfer *transfer;
+     int ret;
+ 
+-    if ((ret = libusb_cancel_transfer(params->transfer)) < 0)
+-        ERR("Failed to cancel transfer: %s\n", libusb_strerror(ret));
++    pthread_mutex_lock(&transfer_mutex);
++    if ((transfer = params->irp->Tail.Overlay.DriverContext[0]))
++    {
++        TRACE("Cancelling transfer %p for IRP %p.\n", transfer, params->irp);
++        if ((ret = libusb_cancel_transfer(transfer)) < 0 && ret != LIBUSB_ERROR_NOT_FOUND)
++            ERR("Failed to cancel transfer: %s\n", libusb_strerror(ret));
++    }
++    pthread_mutex_unlock(&transfer_mutex);
+ 
+     return STATUS_SUCCESS;
+ }
+diff --git a/dlls/wineusb.sys/unixlib.h b/dlls/wineusb.sys/unixlib.h
+index 33469f5..2419090 100644
+--- a/dlls/wineusb.sys/unixlib.h
++++ b/dlls/wineusb.sys/unixlib.h
+@@ -66,7 +66,7 @@ struct usb_submit_urb_params
+ 
+ struct usb_cancel_transfer_params
+ {
+-    void *transfer;
++    IRP *irp;
+ };
+ 
+ struct usb_destroy_device_params
+diff --git a/dlls/wineusb.sys/wineusb.c b/dlls/wineusb.sys/wineusb.c
+index 806c197..b0e6de3 100644
+--- a/dlls/wineusb.sys/wineusb.c
++++ b/dlls/wineusb.sys/wineusb.c
+@@ -173,13 +173,31 @@ static void remove_unix_device(struct unix_device *unix_device)
+ 
+ static HANDLE event_thread;
+ 
++static void clear_cancel_routine(IRP *irp)
++{
++    KIRQL irql;
++
++    /* Synchronize with IoCancelIrp(); once this returns, a concurrently
++     * running cancel routine no longer touches the IRP itself. */
++    IoAcquireCancelSpinLock(&irql);
++    IoSetCancelRoutine(irp, NULL);
++    IoReleaseCancelSpinLock(irql);
++}
++
+ static void complete_irp(IRP *irp)
+ {
++    URB *urb = IoGetCurrentIrpStackLocation(irp)->Parameters.Others.Argument1;
++
+     EnterCriticalSection(&wineusb_cs);
+     RemoveEntryList(&irp->Tail.Overlay.ListEntry);
+     LeaveCriticalSection(&wineusb_cs);
+ 
+-    irp->IoStatus.Status = STATUS_SUCCESS;
++    clear_cancel_routine(irp);
++
++    if (urb->UrbHeader.Status == USBD_STATUS_CANCELED)
++        irp->IoStatus.Status = STATUS_CANCELLED;
++    else
++        irp->IoStatus.Status = STATUS_SUCCESS;
+     IoCompleteRequest(irp, IO_NO_INCREMENT);
+ }
+ 
+@@ -449,6 +467,7 @@ static void remove_pending_irps(struct usb_device *device)
+     while ((entry = RemoveHeadList(&device->irp_list)) != &device->irp_list)
+     {
+         irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
++        clear_cancel_routine(irp);
+         irp->IoStatus.Status = STATUS_DELETE_PENDING;
+         irp->IoStatus.Information = 0;
+         IoCompleteRequest(irp, IO_NO_INCREMENT);
+@@ -525,6 +544,45 @@ static NTSTATUS WINAPI driver_pnp(DEVICE_OBJECT *device, IRP *irp)
+     return pdo_pnp(device, irp);
+ }
+ 
++/* wineusb_cs must be held */
++static BOOL irp_is_queued(struct usb_device *device, IRP *irp)
++{
++    LIST_ENTRY *entry;
++
++    for (entry = device->irp_list.Flink; entry != &device->irp_list; entry = entry->Flink)
++    {
++        if (CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry) == irp)
++            return TRUE;
++    }
++    return FALSE;
++}
++
++/* wineusb_cs must be held, and the IRP must be queued */
++static void cancel_queued_irp(IRP *irp)
++{
++    struct usb_cancel_transfer_params params =
++    {
++        .irp = irp,
++    };
++
++    WINE_UNIX_CALL(unix_usb_cancel_transfer, &params);
++}
++
++static void WINAPI cancel_urb_irp(DEVICE_OBJECT *device_obj, IRP *irp)
++{
++    struct usb_device *device = device_obj->DeviceExtension;
++
++    TRACE("device_obj %p, irp %p.\n", device_obj, irp);
++
++    IoReleaseCancelSpinLock(irp->CancelIrql);
++
++    /* The transfer completes asynchronously with USBD_STATUS_CANCELED. */
++    EnterCriticalSection(&wineusb_cs);
++    if (irp_is_queued(device, irp))
++        cancel_queued_irp(irp);
++    LeaveCriticalSection(&wineusb_cs);
++}
++
+ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
+ {
+     URB *urb = IoGetCurrentIrpStackLocation(irp)->Parameters.Others.Argument1;
+@@ -536,22 +594,25 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
+     {
+         case URB_FUNCTION_ABORT_PIPE:
+         {
++            USBD_PIPE_HANDLE pipe = urb->UrbPipeRequest.PipeHandle;
+             LIST_ENTRY *entry, *mark;
+ 
+             /* The documentation states that URB_FUNCTION_ABORT_PIPE may
+              * complete before outstanding requests complete, so we don't need
+-             * to wait for them. */
++             * to wait for them. Only transfers on the given pipe are
++             * aborted. */
+             EnterCriticalSection(&wineusb_cs);
+             mark = &device->irp_list;
+             for (entry = mark->Flink; entry != mark; entry = entry->Flink)
+             {
+                 IRP *queued_irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+-                struct usb_cancel_transfer_params params =
+-                {
+-                    .transfer = queued_irp->Tail.Overlay.DriverContext[0],
+-                };
++                URB *queued_urb = IoGetCurrentIrpStackLocation(queued_irp)->Parameters.Others.Argument1;
+ 
+-                WINE_UNIX_CALL(unix_usb_cancel_transfer, &params);
++                if (pipe && (queued_urb->UrbHeader.Function != URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER
++                        || queued_urb->UrbBulkOrInterruptTransfer.PipeHandle != pipe))
++                    continue;
++
++                cancel_queued_irp(queued_irp);
+             }
+             LeaveCriticalSection(&wineusb_cs);
+ 
+@@ -565,6 +626,7 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
+         case URB_FUNCTION_VENDOR_DEVICE:
+         case URB_FUNCTION_VENDOR_INTERFACE:
+         case URB_FUNCTION_VENDOR_ENDPOINT:
++        case URB_FUNCTION_CONTROL_TRANSFER:
+         {
+             struct usb_submit_urb_params params =
+             {
+@@ -605,6 +667,16 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
+                         params.transfer_buffer = req->TransferBuffer;
+                     break;
+                 }
++
++                case URB_FUNCTION_CONTROL_TRANSFER:
++                {
++                    struct _URB_CONTROL_TRANSFER *req = &urb->UrbControlTransfer;
++                    if (req->TransferBufferMDL)
++                        params.transfer_buffer = MmGetSystemAddressForMdlSafe(req->TransferBufferMDL, NormalPagePriority);
++                    else
++                        params.transfer_buffer = req->TransferBuffer;
++                    break;
++                }
+             }
+ 
+             /* Hold the wineusb lock while submitting and queuing, and
+@@ -617,6 +689,14 @@ static NTSTATUS usb_submit_urb(struct usb_device *device, IRP *irp)
+             {
+                 IoMarkIrpPending(irp);
+                 InsertTailList(&device->irp_list, &irp->Tail.Overlay.ListEntry);
++
++                IoSetCancelRoutine(irp, cancel_urb_irp);
++                if (irp->Cancel && IoSetCancelRoutine(irp, NULL))
++                {
++                    /* cancelled before the cancel routine was set */
++                    TRACE("IRP %p was already cancelled.\n", irp);
++                    cancel_queued_irp(irp);
++                }
+             }
+             LeaveCriticalSection(&wineusb_cs);
+ 
+diff --git a/dlls/winusb.sys/Makefile.in b/dlls/winusb.sys/Makefile.in
+new file mode 100644
+index 0000000..6808ed2
+--- /dev/null
++++ b/dlls/winusb.sys/Makefile.in
+@@ -0,0 +1,7 @@
++MODULE    = winusb.sys
++IMPORTS   = ntoskrnl
++
++EXTRADLLFLAGS = -Wl,--subsystem,native
++
++SOURCES = \
++	winusb.c
+diff --git a/dlls/winusb.sys/winusb.c b/dlls/winusb.sys/winusb.c
+new file mode 100644
+index 0000000..435b685
+--- /dev/null
++++ b/dlls/winusb.sys/winusb.c
+@@ -0,0 +1,840 @@
++/*
++ * WinUSB function driver
++ *
++ * Copyright 2026 ciroprogamer
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++/*
++ * This driver sits on top of a USB device PDO created by wineusb.sys (one
++ * per device, or one per interface of a composite device). It registers the
++ * device interface classes listed in the "DeviceInterfaceGUIDs" device
++ * parameter, exactly like the native WinUSB does, so that applications can
++ * find the device with SetupDiGetClassDevs() and open it. winusb.dll then
++ * talks to it with the private ioctls defined in wine/winusb_ioctl.h, which
++ * are translated here into URBs for wineusb.sys.
++ */
++
++#include <stdarg.h>
++#include <stdlib.h>
++
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winioctl.h"
++#include "winternl.h"
++#include "ddk/wdm.h"
++#include "ddk/usb.h"
++#include "ddk/usbioctl.h"
++#include "winusbio.h"
++#include "wine/debug.h"
++#include "wine/winusb_ioctl.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(winusb);
++
++/* Data is transferred in chunks of this size, to stay well below the usbfs
++ * per-process memory limit (16 MiB by default). */
++#define MAX_CHUNK_SIZE (1024 * 1024)
++
++#define MAX_PIPES 64
++#define MAX_DEVICE_INTERFACES 8
++
++struct pipe
++{
++    UCHAR address;
++    UCHAR type;
++    USHORT max_packet;
++    USBD_PIPE_HANDLE handle;
++};
++
++struct device
++{
++    DEVICE_OBJECT *device, *pdo, *lower;
++
++    BOOL started, removed;
++
++    UNICODE_STRING iface_names[MAX_DEVICE_INTERFACES];
++    unsigned int iface_count;
++
++    UCHAR device_desc[sizeof(USB_DEVICE_DESCRIPTOR)];
++    UCHAR *config;
++    USHORT config_len;
++    UCHAR speed;
++
++    UCHAR interfaces[WINE_WINUSB_MAX_INTERFACES];
++    UCHAR interface_count;
++
++    struct pipe pipes[MAX_PIPES];
++    unsigned int pipe_count;
++};
++
++static const char *debugstr_setup(const UCHAR *setup)
++{
++    return wine_dbg_sprintf("{%02x %02x %04x %04x %04x}", setup[0], setup[1],
++            setup[2] | (setup[3] << 8), setup[4] | (setup[5] << 8), setup[6] | (setup[7] << 8));
++}
++
++static NTSTATUS status_from_urb(NTSTATUS irp_status, USBD_STATUS urb_status)
++{
++    if (irp_status && irp_status != STATUS_PENDING)
++        return irp_status;
++    if (USBD_SUCCESS(urb_status))
++        return STATUS_SUCCESS;
++
++    switch (urb_status)
++    {
++        case USBD_STATUS_CANCELED:      return STATUS_CANCELLED;
++        case USBD_STATUS_DEVICE_GONE:   return STATUS_DEVICE_NOT_CONNECTED;
++        case USBD_STATUS_TIMEOUT:       return STATUS_IO_TIMEOUT;
++        default:                        return STATUS_UNSUCCESSFUL;
++    }
++}
++
++static struct pipe *find_pipe(struct device *device, UCHAR address)
++{
++    unsigned int i;
++
++    for (i = 0; i < device->pipe_count; ++i)
++    {
++        if (device->pipes[i].address == address)
++            return &device->pipes[i];
++    }
++    return NULL;
++}
++
++/* Synchronous I/O to the lower device; must not be called from the wineusb
++ * event thread. */
++
++static NTSTATUS WINAPI sync_completion(DEVICE_OBJECT *device, IRP *irp, void *context)
++{
++    if (irp->PendingReturned)
++        KeSetEvent(context, IO_NO_INCREMENT, FALSE);
++    return STATUS_MORE_PROCESSING_REQUIRED;
++}
++
++static NTSTATUS submit_urb_sync(struct device *device, URB *urb)
++{
++    IO_STACK_LOCATION *stack;
++    NTSTATUS status;
++    KEVENT event;
++    IRP *irp;
++
++    KeInitializeEvent(&event, NotificationEvent, FALSE);
++
++    if (!(irp = IoAllocateIrp(device->lower->StackSize, FALSE)))
++        return STATUS_NO_MEMORY;
++
++    stack = IoGetNextIrpStackLocation(irp);
++    stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
++    stack->Parameters.DeviceIoControl.IoControlCode = IOCTL_INTERNAL_USB_SUBMIT_URB;
++    stack->Parameters.Others.Argument1 = urb;
++    IoSetCompletionRoutine(irp, sync_completion, &event, TRUE, TRUE, TRUE);
++
++    if (IoCallDriver(device->lower, irp) == STATUS_PENDING)
++        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
++
++    status = status_from_urb(irp->IoStatus.Status, urb->UrbHeader.Status);
++    IoFreeIrp(irp);
++    return status;
++}
++
++static NTSTATUS get_descriptor_sync(struct device *device, UCHAR type, UCHAR index,
++        void *buffer, ULONG length, ULONG *ret_length)
++{
++    struct _URB_CONTROL_DESCRIPTOR_REQUEST urb = {{0}};
++    NTSTATUS status;
++
++    urb.Hdr.Length = sizeof(urb);
++    urb.Hdr.Function = URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE;
++    urb.TransferBuffer = buffer;
++    urb.TransferBufferLength = length;
++    urb.DescriptorType = type;
++    urb.Index = index;
++
++    status = submit_urb_sync(device, (URB *)&urb);
++    if (ret_length) *ret_length = urb.TransferBufferLength;
++    return status;
++}
++
++static BOOL interface_is_ours(struct device *device, UCHAR number)
++{
++    unsigned int i;
++
++    for (i = 0; i < device->interface_count; ++i)
++    {
++        if (device->interfaces[i] == number)
++            return TRUE;
++    }
++    return FALSE;
++}
++
++/* wineusb.sys creates one PDO per interface for composite devices, with a
++ * hardware ID ending in "&MI_xx". Returns -1 for a whole device. */
++static int get_pdo_interface(struct device *device)
++{
++    WCHAR buffer[512], *p;
++    ULONG needed;
++
++    if (IoGetDeviceProperty(device->pdo, DevicePropertyHardwareID, sizeof(buffer) - sizeof(WCHAR),
++            buffer, &needed))
++        return -1;
++    buffer[ARRAY_SIZE(buffer) - 1] = 0;
++
++    TRACE("hardware ID %s.\n", debugstr_w(buffer));
++
++    if (!(p = wcsstr(buffer, L"&MI_")))
++        return -1;
++    return wcstoul(p + 4, NULL, 16);
++}
++
++static void parse_config(struct device *device)
++{
++    const UCHAR *ptr = device->config, *end = device->config + device->config_len;
++    int pdo_interface = get_pdo_interface(device);
++    BOOL ours = FALSE;
++
++    device->interface_count = 0;
++    device->pipe_count = 0;
++
++    /* Collect the interfaces we expose, in descriptor order. */
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == USB_INTERFACE_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_INTERFACE_DESCRIPTOR))
++        {
++            const USB_INTERFACE_DESCRIPTOR *iface = (const USB_INTERFACE_DESCRIPTOR *)ptr;
++
++            if ((pdo_interface == -1 || iface->bInterfaceNumber == pdo_interface)
++                    && !interface_is_ours(device, iface->bInterfaceNumber)
++                    && device->interface_count < WINE_WINUSB_MAX_INTERFACES)
++                device->interfaces[device->interface_count++] = iface->bInterfaceNumber;
++        }
++        ptr += ptr[0];
++    }
++
++    /* Collect the endpoints of those interfaces, including all alternate
++     * settings. */
++    ptr = device->config;
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == USB_INTERFACE_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_INTERFACE_DESCRIPTOR))
++        {
++            const USB_INTERFACE_DESCRIPTOR *iface = (const USB_INTERFACE_DESCRIPTOR *)ptr;
++            ours = interface_is_ours(device, iface->bInterfaceNumber);
++        }
++        else if (ptr[1] == USB_ENDPOINT_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_ENDPOINT_DESCRIPTOR) && ours)
++        {
++            const USB_ENDPOINT_DESCRIPTOR *ep = (const USB_ENDPOINT_DESCRIPTOR *)ptr;
++
++            if (!find_pipe(device, ep->bEndpointAddress) && device->pipe_count < MAX_PIPES)
++            {
++                struct pipe *pipe = &device->pipes[device->pipe_count++];
++
++                pipe->address = ep->bEndpointAddress;
++                pipe->type = ep->bmAttributes & USB_ENDPOINT_TYPE_MASK;
++                pipe->max_packet = ep->wMaxPacketSize & 0x7ff;
++                pipe->handle = NULL;
++                TRACE("endpoint %#x, type %u, max packet %u.\n", pipe->address, pipe->type, pipe->max_packet);
++            }
++        }
++        ptr += ptr[0];
++    }
++
++    TRACE("PDO interface %d, exposing %u interfaces and %u pipes.\n",
++            pdo_interface, device->interface_count, device->pipe_count);
++}
++
++static NTSTATUS select_configuration(struct device *device)
++{
++    struct _URB_SELECT_CONFIGURATION *urb;
++    unsigned int i, size;
++    NTSTATUS status;
++
++    if (!device->pipe_count)
++        return STATUS_SUCCESS;
++
++    size = FIELD_OFFSET(struct _URB_SELECT_CONFIGURATION, Interface.Pipes[device->pipe_count]);
++    if (!(urb = ExAllocatePool(NonPagedPool, size)))
++        return STATUS_NO_MEMORY;
++    memset(urb, 0, size);
++
++    urb->Hdr.Length = size;
++    urb->Hdr.Function = URB_FUNCTION_SELECT_CONFIGURATION;
++    urb->ConfigurationDescriptor = (USB_CONFIGURATION_DESCRIPTOR *)device->config;
++    urb->Interface.Length = size - FIELD_OFFSET(struct _URB_SELECT_CONFIGURATION, Interface);
++    urb->Interface.InterfaceNumber = device->interfaces[0];
++    urb->Interface.NumberOfPipes = device->pipe_count;
++    for (i = 0; i < device->pipe_count; ++i)
++    {
++        USBD_PIPE_INFORMATION *pipe = &urb->Interface.Pipes[i];
++
++        pipe->EndpointAddress = device->pipes[i].address;
++        pipe->PipeType = device->pipes[i].type;
++        pipe->MaximumPacketSize = device->pipes[i].max_packet;
++        pipe->MaximumTransferSize = MAX_CHUNK_SIZE;
++    }
++
++    if (!(status = submit_urb_sync(device, (URB *)urb)))
++    {
++        for (i = 0; i < device->pipe_count; ++i)
++            device->pipes[i].handle = urb->Interface.Pipes[i].PipeHandle;
++    }
++
++    ExFreePool(urb);
++    return status;
++}
++
++static NTSTATUS init_usb_device(struct device *device)
++{
++    USB_CONFIGURATION_DESCRIPTOR header;
++    const USB_DEVICE_DESCRIPTOR *desc;
++    ULONG len;
++    NTSTATUS status;
++
++    if ((status = get_descriptor_sync(device, USB_DEVICE_DESCRIPTOR_TYPE, 0,
++            device->device_desc, sizeof(device->device_desc), &len)))
++    {
++        ERR("Failed to get device descriptor, status %#lx.\n", status);
++        return status;
++    }
++    desc = (const USB_DEVICE_DESCRIPTOR *)device->device_desc;
++    TRACE("device %04x:%04x, bcdUSB %04x.\n", desc->idVendor, desc->idProduct, desc->bcdUSB);
++
++    /* WinUSB reports HighSpeed for anything faster than full speed. */
++    device->speed = desc->bcdUSB >= 0x0200 ? HighSpeed : FullSpeed;
++
++    if ((status = get_descriptor_sync(device, USB_CONFIGURATION_DESCRIPTOR_TYPE, 0,
++            &header, sizeof(header), &len)) || len < sizeof(header))
++    {
++        ERR("Failed to get configuration descriptor header, status %#lx.\n", status);
++        return status ? status : STATUS_UNSUCCESSFUL;
++    }
++
++    if (!(device->config = ExAllocatePool(NonPagedPool, header.wTotalLength)))
++        return STATUS_NO_MEMORY;
++    if ((status = get_descriptor_sync(device, USB_CONFIGURATION_DESCRIPTOR_TYPE, 0,
++            device->config, header.wTotalLength, &len)))
++    {
++        ERR("Failed to get configuration descriptor, status %#lx.\n", status);
++        return status;
++    }
++    device->config_len = len;
++
++    parse_config(device);
++
++    if ((status = select_configuration(device)))
++        ERR("Failed to select configuration, status %#lx.\n", status);
++    return status;
++}
++
++static void register_device_interfaces(struct device *device)
++{
++    static const WCHAR *const value_names[] = {L"DeviceInterfaceGUIDs", L"DeviceInterfaceGUID"};
++    KEY_VALUE_PARTIAL_INFORMATION *info;
++    UNICODE_STRING name, guid_str;
++    ULONG size = 4096, ret_size;
++    unsigned int i;
++    NTSTATUS status;
++    HANDLE key;
++    GUID guid;
++    WCHAR *p;
++
++    if ((status = IoOpenDeviceRegistryKey(device->pdo, PLUGPLAY_REGKEY_DEVICE, KEY_READ, &key)))
++    {
++        ERR("Failed to open device registry key, status %#lx.\n", status);
++        return;
++    }
++
++    if (!(info = ExAllocatePool(PagedPool, size)))
++    {
++        ZwClose(key);
++        return;
++    }
++
++    for (i = 0; i < ARRAY_SIZE(value_names) && !device->iface_count; ++i)
++    {
++        RtlInitUnicodeString(&name, value_names[i]);
++        memset(info, 0, size);
++        if (ZwQueryValueKey(key, &name, KeyValuePartialInformation, info, size - sizeof(WCHAR), &ret_size))
++            continue;
++        if (info->Type != REG_SZ && info->Type != REG_MULTI_SZ && info->Type != REG_EXPAND_SZ)
++            continue;
++
++        for (p = (WCHAR *)info->Data; *p && device->iface_count < MAX_DEVICE_INTERFACES; p += wcslen(p) + 1)
++        {
++            RtlInitUnicodeString(&guid_str, p);
++            if (RtlGUIDFromString(&guid_str, &guid))
++            {
++                WARN("Invalid interface GUID %s.\n", debugstr_w(p));
++                continue;
++            }
++
++            if ((status = IoRegisterDeviceInterface(device->pdo, &guid, NULL,
++                    &device->iface_names[device->iface_count])))
++            {
++                ERR("Failed to register interface %s, status %#lx.\n", debugstr_guid(&guid), status);
++                continue;
++            }
++            TRACE("Registered interface %s as %s.\n", debugstr_guid(&guid),
++                    debugstr_w(device->iface_names[device->iface_count].Buffer));
++            ++device->iface_count;
++        }
++    }
++
++    if (!device->iface_count)
++        WARN("No DeviceInterfaceGUIDs found; the device can't be opened by applications.\n");
++
++    ExFreePool(info);
++    ZwClose(key);
++}
++
++static void set_interfaces_state(struct device *device, BOOL enable)
++{
++    unsigned int i;
++
++    for (i = 0; i < device->iface_count; ++i)
++        IoSetDeviceInterfaceState(&device->iface_names[i], enable);
++}
++
++static NTSTATUS forward_irp_sync(struct device *device, IRP *irp)
++{
++    KEVENT event;
++    NTSTATUS status;
++
++    KeInitializeEvent(&event, NotificationEvent, FALSE);
++    IoCopyCurrentIrpStackLocationToNext(irp);
++    IoSetCompletionRoutine(irp, sync_completion, &event, TRUE, TRUE, TRUE);
++
++    status = IoCallDriver(device->lower, irp);
++    if (status == STATUS_PENDING)
++    {
++        KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
++        status = irp->IoStatus.Status;
++    }
++    return status;
++}
++
++static NTSTATUS WINAPI driver_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    struct device *device = device_obj->DeviceExtension;
++    NTSTATUS status;
++    unsigned int i;
++
++    TRACE("device %p, irp %p, minor function %#x.\n", device_obj, irp, stack->MinorFunction);
++
++    switch (stack->MinorFunction)
++    {
++        case IRP_MN_START_DEVICE:
++            if ((status = forward_irp_sync(device, irp)))
++            {
++                irp->IoStatus.Status = status;
++                IoCompleteRequest(irp, IO_NO_INCREMENT);
++                return status;
++            }
++
++            if (!(status = init_usb_device(device)))
++            {
++                if (!device->iface_count)
++                    register_device_interfaces(device);
++                device->started = TRUE;
++                set_interfaces_state(device, TRUE);
++            }
++
++            irp->IoStatus.Status = status;
++            IoCompleteRequest(irp, IO_NO_INCREMENT);
++            return status;
++
++        case IRP_MN_SURPRISE_REMOVAL:
++            device->removed = TRUE;
++            set_interfaces_state(device, FALSE);
++            irp->IoStatus.Status = STATUS_SUCCESS;
++            IoSkipCurrentIrpStackLocation(irp);
++            return IoCallDriver(device->lower, irp);
++
++        case IRP_MN_REMOVE_DEVICE:
++            device->removed = TRUE;
++            set_interfaces_state(device, FALSE);
++
++            irp->IoStatus.Status = STATUS_SUCCESS;
++            IoSkipCurrentIrpStackLocation(irp);
++            status = IoCallDriver(device->lower, irp);
++
++            for (i = 0; i < device->iface_count; ++i)
++                RtlFreeUnicodeString(&device->iface_names[i]);
++            if (device->config)
++                ExFreePool(device->config);
++            IoDetachDevice(device->lower);
++            IoDeleteDevice(device->device);
++            return status;
++
++        default:
++            IoSkipCurrentIrpStackLocation(irp);
++            return IoCallDriver(device->lower, irp);
++    }
++}
++
++static NTSTATUS complete_request(IRP *irp, NTSTATUS status, ULONG_PTR information)
++{
++    irp->IoStatus.Status = status;
++    irp->IoStatus.Information = information;
++    IoCompleteRequest(irp, IO_NO_INCREMENT);
++    return status;
++}
++
++static NTSTATUS WINAPI driver_create_close(DEVICE_OBJECT *device_obj, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    struct device *device = device_obj->DeviceExtension;
++
++    TRACE("device %p, irp %p, major %#x.\n", device_obj, irp, stack->MajorFunction);
++
++    if (stack->MajorFunction == IRP_MJ_CREATE && (device->removed || !device->started))
++        return complete_request(irp, STATUS_DELETE_PENDING, 0);
++    return complete_request(irp, STATUS_SUCCESS, 0);
++}
++
++/* Asynchronous transfers. The user IRP itself is sent down to wineusb.sys,
++ * one chunk at a time; the completion routine resubmits it until the
++ * transfer is done. Cancellation is handled by wineusb.sys. */
++
++struct transfer
++{
++    union
++    {
++        struct _URB_HEADER hdr;
++        struct _URB_BULK_OR_INTERRUPT_TRANSFER bulk;
++        struct _URB_CONTROL_TRANSFER control;
++        struct _URB_PIPE_REQUEST pipe;
++    } urb;
++
++    struct device *device;
++    UCHAR *buffer;
++    ULONG total, done, chunk;
++    USBD_PIPE_HANDLE pipe;
++    USHORT max_packet;
++    BOOL in, zlp, zlp_phase, is_control;
++};
++
++static NTSTATUS WINAPI transfer_completion(DEVICE_OBJECT *device_obj, IRP *irp, void *context);
++
++static void prepare_lower(struct transfer *transfer, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetNextIrpStackLocation(irp);
++
++    stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
++    stack->MinorFunction = 0;
++    stack->Flags = 0;
++    stack->Parameters.DeviceIoControl.IoControlCode = IOCTL_INTERNAL_USB_SUBMIT_URB;
++    stack->Parameters.Others.Argument1 = &transfer->urb;
++    IoSetCompletionRoutine(irp, transfer_completion, transfer, TRUE, TRUE, TRUE);
++}
++
++static void submit_bulk_chunk(struct transfer *transfer, IRP *irp)
++{
++    struct _URB_BULK_OR_INTERRUPT_TRANSFER *req = &transfer->urb.bulk;
++    ULONG len = transfer->zlp_phase ? 0 : min(transfer->total - transfer->done, MAX_CHUNK_SIZE);
++
++    memset(req, 0, sizeof(*req));
++    req->Hdr.Length = sizeof(*req);
++    req->Hdr.Function = URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER;
++    req->PipeHandle = transfer->pipe;
++    req->TransferFlags = transfer->in ? (USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK) : 0;
++    req->TransferBufferLength = len;
++    req->TransferBuffer = transfer->buffer + transfer->done;
++    transfer->chunk = len;
++
++    prepare_lower(transfer, irp);
++    IoCallDriver(transfer->device->lower, irp);
++}
++
++static NTSTATUS WINAPI transfer_completion(DEVICE_OBJECT *device_obj, IRP *irp, void *context)
++{
++    struct transfer *transfer = context;
++    NTSTATUS status;
++    ULONG got;
++
++    status = status_from_urb(irp->IoStatus.Status, transfer->urb.hdr.Status);
++
++    if (transfer->is_control)
++    {
++        got = transfer->urb.control.TransferBufferLength;
++        TRACE("control transfer done, status %#lx, length %lu.\n", status, got);
++        ExFreePool(transfer);
++        complete_request(irp, status, NT_ERROR(status) ? 0 : got);
++        return STATUS_MORE_PROCESSING_REQUIRED;
++    }
++
++    got = transfer->urb.bulk.TransferBufferLength;
++    if (!transfer->zlp_phase && got <= transfer->chunk)
++        transfer->done += got;
++
++    TRACE("pipe %p chunk done, status %#lx, got %lu/%lu, total %lu/%lu.\n", transfer->pipe,
++            status, got, transfer->chunk, transfer->done, transfer->total);
++
++    if (!status && !transfer->zlp_phase)
++    {
++        BOOL more = transfer->done < transfer->total && got == transfer->chunk;
++
++        if (!more && transfer->zlp && !transfer->in && transfer->total
++                && transfer->max_packet && !(transfer->total % transfer->max_packet))
++        {
++            transfer->zlp_phase = TRUE;
++            more = TRUE;
++        }
++
++        if (more)
++        {
++            if (irp->Cancel)
++            {
++                status = STATUS_CANCELLED;
++            }
++            else
++            {
++                submit_bulk_chunk(transfer, irp);
++                return STATUS_MORE_PROCESSING_REQUIRED;
++            }
++        }
++    }
++
++    if (status == STATUS_CANCELLED && transfer->in && transfer->done)
++    {
++        /* WinUSB reports the data received before the cancellation. */
++        status = STATUS_SUCCESS;
++    }
++
++    /* For writes there is no output buffer; Information still reaches the
++     * caller as the number of bytes transferred. */
++    got = transfer->done;
++    ExFreePool(transfer);
++    complete_request(irp, status, got);
++    return STATUS_MORE_PROCESSING_REQUIRED;
++}
++
++static NTSTATUS start_bulk(struct device *device, IRP *irp, BOOL in)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    ULONG in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
++    ULONG out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
++    struct wine_winusb_transfer header;
++    struct transfer *transfer;
++    struct pipe *pipe;
++
++    if (in_len < sizeof(header))
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++    memcpy(&header, irp->AssociatedIrp.SystemBuffer, sizeof(header));
++
++    if (!(pipe = find_pipe(device, header.pipe)) || !pipe->handle
++            || !!(header.pipe & USB_ENDPOINT_DIRECTION_MASK) != in
++            || (pipe->type != UsbdPipeTypeBulk && pipe->type != UsbdPipeTypeInterrupt))
++    {
++        WARN("Invalid pipe %#x for %s.\n", header.pipe, in ? "read" : "write");
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++    }
++
++    if (in ? header.length > out_len : header.length > in_len - sizeof(header))
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++
++    if (!(transfer = ExAllocatePool(NonPagedPool, sizeof(*transfer))))
++        return complete_request(irp, STATUS_NO_MEMORY, 0);
++    memset(transfer, 0, sizeof(*transfer));
++
++    transfer->device = device;
++    transfer->in = in;
++    transfer->pipe = pipe->handle;
++    transfer->max_packet = pipe->max_packet;
++    transfer->total = header.length;
++    transfer->zlp = !!(header.flags & WINE_WINUSB_FLAG_ZLP);
++    /* for writes, the data follows the header in the input buffer; reads
++     * are returned at the start of the (shared) system buffer */
++    transfer->buffer = (UCHAR *)irp->AssociatedIrp.SystemBuffer + (in ? 0 : sizeof(header));
++
++    TRACE("%s pipe %#x, length %lu.\n", in ? "read" : "write", header.pipe, (ULONG)header.length);
++
++    IoMarkIrpPending(irp);
++    submit_bulk_chunk(transfer, irp);
++    return STATUS_PENDING;
++}
++
++static NTSTATUS start_control(struct device *device, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    ULONG in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
++    ULONG out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
++    struct _URB_CONTROL_TRANSFER *req;
++    struct wine_winusb_control header;
++    struct transfer *transfer;
++    USHORT length;
++    BOOL in;
++
++    if (in_len < sizeof(header))
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++    memcpy(&header, irp->AssociatedIrp.SystemBuffer, sizeof(header));
++
++    in = !!(header.setup[0] & 0x80);
++    length = header.setup[6] | (header.setup[7] << 8);
++
++    TRACE("setup %s.\n", debugstr_setup(header.setup));
++
++    if (in ? length > out_len : length > in_len - sizeof(header))
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++
++    if (!(transfer = ExAllocatePool(NonPagedPool, sizeof(*transfer))))
++        return complete_request(irp, STATUS_NO_MEMORY, 0);
++    memset(transfer, 0, sizeof(*transfer));
++    transfer->device = device;
++    transfer->is_control = TRUE;
++    transfer->in = in;
++
++    req = &transfer->urb.control;
++    req->Hdr.Length = sizeof(*req);
++    req->Hdr.Function = URB_FUNCTION_CONTROL_TRANSFER;
++    req->TransferFlags = (in ? USBD_TRANSFER_DIRECTION_IN : 0) | USBD_SHORT_TRANSFER_OK;
++    req->TransferBufferLength = length;
++    /* IN data goes at the start of the system buffer, OUT data follows the header */
++    req->TransferBuffer = (UCHAR *)irp->AssociatedIrp.SystemBuffer + (in ? 0 : sizeof(header));
++    memcpy(req->SetupPacket, header.setup, sizeof(req->SetupPacket));
++
++    IoMarkIrpPending(irp);
++    prepare_lower(transfer, irp);
++    IoCallDriver(device->lower, irp);
++    return STATUS_PENDING;
++}
++
++static NTSTATUS pipe_request(struct device *device, IRP *irp, USHORT function)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    struct _URB_PIPE_REQUEST urb = {{0}};
++    struct wine_winusb_pipe header;
++    struct pipe *pipe;
++    NTSTATUS status;
++
++    if (stack->Parameters.DeviceIoControl.InputBufferLength < sizeof(header))
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++    memcpy(&header, irp->AssociatedIrp.SystemBuffer, sizeof(header));
++
++    if (!(pipe = find_pipe(device, header.pipe)) || !pipe->handle)
++        return complete_request(irp, STATUS_INVALID_PARAMETER, 0);
++
++    TRACE("function %#x, pipe %#x.\n", function, header.pipe);
++
++    urb.Hdr.Length = sizeof(urb);
++    urb.Hdr.Function = function;
++    urb.PipeHandle = pipe->handle;
++
++    /* Both requests complete synchronously in wineusb.sys. */
++    status = submit_urb_sync(device, (URB *)&urb);
++    return complete_request(irp, status, 0);
++}
++
++static NTSTATUS get_info(struct device *device, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    ULONG out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
++    struct wine_winusb_info *info = irp->AssociatedIrp.SystemBuffer;
++    ULONG size = sizeof(*info) + device->config_len;
++
++    if (out_len < size)
++        return complete_request(irp, STATUS_BUFFER_TOO_SMALL, 0);
++
++    memset(info, 0, sizeof(*info));
++    info->size = size;
++    info->speed = device->speed;
++    info->interface_count = device->interface_count;
++    info->config_length = device->config_len;
++    memcpy(info->interfaces, device->interfaces, device->interface_count);
++    memcpy(info->device_descriptor, device->device_desc, sizeof(info->device_descriptor));
++    memcpy(info + 1, device->config, device->config_len);
++
++    return complete_request(irp, STATUS_SUCCESS, size);
++}
++
++static NTSTATUS WINAPI driver_ioctl(DEVICE_OBJECT *device_obj, IRP *irp)
++{
++    IO_STACK_LOCATION *stack = IoGetCurrentIrpStackLocation(irp);
++    ULONG code = stack->Parameters.DeviceIoControl.IoControlCode;
++    struct device *device = device_obj->DeviceExtension;
++
++    TRACE("device %p, irp %p, code %#lx.\n", device_obj, irp, code);
++
++    if (device->removed)
++        return complete_request(irp, STATUS_DEVICE_NOT_CONNECTED, 0);
++    if (!device->started)
++        return complete_request(irp, STATUS_DEVICE_NOT_READY, 0);
++
++    switch (code)
++    {
++        case IOCTL_WINE_WINUSB_GET_INFO:
++            return get_info(device, irp);
++        case IOCTL_WINE_WINUSB_CONTROL:
++            return start_control(device, irp);
++        case IOCTL_WINE_WINUSB_READ_PIPE:
++            return start_bulk(device, irp, TRUE);
++        case IOCTL_WINE_WINUSB_WRITE_PIPE:
++            return start_bulk(device, irp, FALSE);
++        case IOCTL_WINE_WINUSB_ABORT_PIPE:
++            return pipe_request(device, irp, URB_FUNCTION_ABORT_PIPE);
++        case IOCTL_WINE_WINUSB_RESET_PIPE:
++            return pipe_request(device, irp, URB_FUNCTION_SYNC_RESET_PIPE_AND_CLEAR_STALL);
++        default:
++            FIXME("Unhandled ioctl %#lx.\n", code);
++            return complete_request(irp, STATUS_NOT_SUPPORTED, 0);
++    }
++}
++
++static NTSTATUS WINAPI driver_add_device(DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo)
++{
++    struct device *device;
++    DEVICE_OBJECT *fdo;
++    NTSTATUS status;
++
++    TRACE("driver %p, pdo %p.\n", driver, pdo);
++
++    if ((status = IoCreateDevice(driver, sizeof(*device), NULL, FILE_DEVICE_USB, 0, FALSE, &fdo)))
++    {
++        ERR("Failed to create FDO, status %#lx.\n", status);
++        return status;
++    }
++
++    device = fdo->DeviceExtension;
++    memset(device, 0, sizeof(*device));
++    device->device = fdo;
++    device->pdo = pdo;
++    device->lower = IoAttachDeviceToDeviceStack(fdo, pdo);
++
++    fdo->Flags |= DO_BUFFERED_IO;
++    fdo->Flags &= ~DO_DEVICE_INITIALIZING;
++    return STATUS_SUCCESS;
++}
++
++static void WINAPI driver_unload(DRIVER_OBJECT *driver)
++{
++    TRACE("driver %p.\n", driver);
++}
++
++NTSTATUS WINAPI DriverEntry(DRIVER_OBJECT *driver, UNICODE_STRING *path)
++{
++    TRACE("driver %p, path %s.\n", driver, debugstr_w(path->Buffer));
++
++    driver->DriverExtension->AddDevice = driver_add_device;
++    driver->DriverUnload = driver_unload;
++    driver->MajorFunction[IRP_MJ_PNP] = driver_pnp;
++    driver->MajorFunction[IRP_MJ_CREATE] = driver_create_close;
++    driver->MajorFunction[IRP_MJ_CLOSE] = driver_create_close;
++    driver->MajorFunction[IRP_MJ_CLEANUP] = driver_create_close;
++    driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = driver_ioctl;
++
++    return STATUS_SUCCESS;
++}
+diff --git a/dlls/winusb/main.c b/dlls/winusb/main.c
+index 52682a5..d0b002b 100644
+--- a/dlls/winusb/main.c
++++ b/dlls/winusb/main.c
+@@ -1,5 +1,8 @@
+ /*
++ * WinUSB user-mode library
++ *
+  * Copyright (C) 2022 Mohamad Al-Jaf
++ * Copyright 2026 ciroprogamer
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -17,20 +20,978 @@
+  */
+ 
+ #include <stdarg.h>
++#include <stdlib.h>
+ 
+ #include "windef.h"
+ #include "winbase.h"
++#include "winioctl.h"
+ #include "winusb.h"
+ 
+ #include "wine/debug.h"
++#include "wine/winusb_ioctl.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(winusb);
+ 
++#define INTERFACE_MAGIC 0x57555342 /* 'WUSB' */
++#define MAX_INFO_SIZE 65536
++#define DEFAULT_CONTROL_TIMEOUT 5000
++#define REPORTED_MAX_TRANSFER_SIZE (4 * 1024 * 1024)
++
++struct pipe_policy
++{
++    BOOL short_packet_terminate;
++    BOOL auto_clear_stall;
++    BOOL ignore_short_packets;
++    BOOL allow_partial_reads;
++    BOOL auto_flush;
++    BOOL raw_io;
++    BOOL reset_pipe_on_resume;
++    ULONG timeout;
++};
++
++struct device
++{
++    LONG refcount;
++    HANDLE file;
++    struct wine_winusb_info *info;
++    const UCHAR *config;
++};
++
++struct interface
++{
++    DWORD magic;
++    struct device *device;
++    UCHAR index;    /* index into info->interfaces */
++    UCHAR number;   /* bInterfaceNumber */
++    UCHAR alt;      /* current alternate setting index */
++    UCHAR auto_suspend;
++    ULONG suspend_delay;
++    struct pipe_policy policies[32];
++};
++
++static struct interface *get_interface(WINUSB_INTERFACE_HANDLE handle)
++{
++    struct interface *iface = handle;
++
++    if (!iface || iface->magic != INTERFACE_MAGIC)
++    {
++        SetLastError(ERROR_INVALID_HANDLE);
++        return NULL;
++    }
++    return iface;
++}
++
++static unsigned int pipe_index(UCHAR pipe)
++{
++    return (pipe & 0x0f) | ((pipe & 0x80) >> 3);
++}
++
++static struct pipe_policy *get_policy(struct interface *iface, UCHAR pipe)
++{
++    return &iface->policies[pipe_index(pipe)];
++}
++
++/* Descriptor helpers */
++
++static const UCHAR *config_end(const struct device *device)
++{
++    return device->config + device->info->config_length;
++}
++
++static const USB_INTERFACE_DESCRIPTOR *find_interface_desc(const struct device *device, UCHAR number, UCHAR alt_index)
++{
++    const UCHAR *ptr = device->config, *end = config_end(device);
++    unsigned int count = 0;
++
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == USB_INTERFACE_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_INTERFACE_DESCRIPTOR))
++        {
++            const USB_INTERFACE_DESCRIPTOR *desc = (const USB_INTERFACE_DESCRIPTOR *)ptr;
++
++            if (desc->bInterfaceNumber == number && count++ == alt_index)
++                return desc;
++        }
++        ptr += ptr[0];
++    }
++    return NULL;
++}
++
++static const USB_ENDPOINT_DESCRIPTOR *find_endpoint_desc(const struct device *device,
++        const USB_INTERFACE_DESCRIPTOR *iface, unsigned int index)
++{
++    const UCHAR *ptr = (const UCHAR *)iface + iface->bLength, *end = config_end(device);
++    unsigned int count = 0;
++
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == USB_INTERFACE_DESCRIPTOR_TYPE)
++            break;
++        if (ptr[1] == USB_ENDPOINT_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_ENDPOINT_DESCRIPTOR))
++        {
++            if (count++ == index)
++                return (const USB_ENDPOINT_DESCRIPTOR *)ptr;
++        }
++        ptr += ptr[0];
++    }
++    return NULL;
++}
++
++/* Find the endpoint descriptor of a pipe in the interface's current setting. */
++static const USB_ENDPOINT_DESCRIPTOR *find_pipe_desc(const struct interface *iface, UCHAR pipe)
++{
++    const USB_INTERFACE_DESCRIPTOR *desc;
++    const USB_ENDPOINT_DESCRIPTOR *ep;
++    unsigned int i;
++
++    if (!(desc = find_interface_desc(iface->device, iface->number, iface->alt)))
++        return NULL;
++    for (i = 0; (ep = find_endpoint_desc(iface->device, desc, i)); ++i)
++    {
++        if (ep->bEndpointAddress == pipe)
++            return ep;
++    }
++    return NULL;
++}
++
++/* I/O helpers */
++
++static BOOL do_ioctl(struct device *device, DWORD code, void *in, DWORD in_len,
++        void *out, DWORD out_len, ULONG *ret_len, OVERLAPPED *user_ov, ULONG timeout)
++{
++    OVERLAPPED ov = {0};
++    DWORD len = 0, err;
++    BOOL ret;
++
++    if (user_ov)
++    {
++        ret = DeviceIoControl(device->file, code, in, in_len, out, out_len, &len, user_ov);
++        if (ret_len) *ret_len = len;
++        return ret;
++    }
++
++    if (!(ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL)))
++        return FALSE;
++
++    ret = DeviceIoControl(device->file, code, in, in_len, out, out_len, &len, &ov);
++    if (!ret && GetLastError() == ERROR_IO_PENDING)
++    {
++        if (WaitForSingleObject(ov.hEvent, timeout ? timeout : INFINITE) == WAIT_TIMEOUT)
++        {
++            TRACE("ioctl %#lx timed out after %lu ms.\n", code, timeout);
++            CancelIoEx(device->file, &ov);
++            GetOverlappedResult(device->file, &ov, &len, TRUE);
++            ret = FALSE;
++            err = ERROR_SEM_TIMEOUT;
++        }
++        else
++        {
++            ret = GetOverlappedResult(device->file, &ov, &len, FALSE);
++            err = GetLastError();
++        }
++    }
++    else
++        err = GetLastError();
++
++    CloseHandle(ov.hEvent);
++    if (ret_len) *ret_len = len;
++    if (!ret) SetLastError(err);
++    return ret;
++}
++
++static void release_device(struct device *device)
++{
++    if (InterlockedDecrement(&device->refcount))
++        return;
++    free(device->info);
++    free(device);
++}
++
++static struct interface *create_interface(struct device *device, UCHAR index)
++{
++    struct interface *iface;
++    unsigned int i;
++
++    if (!(iface = calloc(1, sizeof(*iface))))
++        return NULL;
++
++    InterlockedIncrement(&device->refcount);
++    iface->magic = INTERFACE_MAGIC;
++    iface->device = device;
++    iface->index = index;
++    iface->number = device->info->interfaces[index];
++    iface->alt = 0;
++    iface->auto_suspend = 1;
++    iface->suspend_delay = 5000;
++    for (i = 0; i < ARRAY_SIZE(iface->policies); ++i)
++        iface->policies[i].allow_partial_reads = TRUE;
++    iface->policies[0].timeout = DEFAULT_CONTROL_TIMEOUT;
++    return iface;
++}
++
++/***********************************************************************
++ *           WinUsb_Initialize (winusb.@)
++ */
++BOOL WINAPI WinUsb_Initialize(HANDLE file, PWINUSB_INTERFACE_HANDLE handle)
++{
++    struct wine_winusb_info *info;
++    struct device *device;
++    struct interface *iface;
++    ULONG len;
++
++    TRACE("file %p, handle %p.\n", file, handle);
++
++    if (!handle || !file || file == INVALID_HANDLE_VALUE)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    if (!(device = calloc(1, sizeof(*device))) || !(info = malloc(MAX_INFO_SIZE)))
++    {
++        free(device);
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    device->file = file;
++    device->refcount = 1;
++
++    if (!do_ioctl(device, IOCTL_WINE_WINUSB_GET_INFO, NULL, 0, info, MAX_INFO_SIZE, &len, NULL, 0))
++    {
++        DWORD err = GetLastError();
++        WARN("Failed to get device information, error %lu; is winusb.sys loaded for this device?\n", err);
++        free(info);
++        free(device);
++        SetLastError(err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED ? ERROR_INVALID_HANDLE : err);
++        return FALSE;
++    }
++
++    if (len < sizeof(*info) || info->size > len || !info->interface_count)
++    {
++        ERR("Invalid device information (length %lu, interfaces %u).\n", len, len >= sizeof(*info) ? info->interface_count : 0);
++        free(info);
++        free(device);
++        SetLastError(ERROR_GEN_FAILURE);
++        return FALSE;
++    }
++
++    device->info = info;
++    device->config = (const UCHAR *)(info + 1);
++
++    TRACE("device %04x:%04x, %u interface(s), first %u, config length %u.\n",
++            ((USB_DEVICE_DESCRIPTOR *)info->device_descriptor)->idVendor,
++            ((USB_DEVICE_DESCRIPTOR *)info->device_descriptor)->idProduct,
++            info->interface_count, info->interfaces[0], info->config_length);
++
++    iface = create_interface(device, 0);
++    release_device(device); /* now owned by the interface */
++    if (!iface)
++    {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++
++    *handle = iface;
++    TRACE("Returning interface %p.\n", iface);
++    return TRUE;
++}
++
+ /***********************************************************************
+  *           WinUsb_Free (winusb.@)
+  */
+ BOOL WINAPI WinUsb_Free(WINUSB_INTERFACE_HANDLE handle)
+ {
+-    FIXME( "(%p) - stub\n", handle );
++    struct interface *iface;
++
++    TRACE("handle %p.\n", handle);
++
++    if (!handle) return TRUE;
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++
++    iface->magic = 0;
++    release_device(iface->device);
++    free(iface);
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_GetAssociatedInterface (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetAssociatedInterface(WINUSB_INTERFACE_HANDLE handle, UCHAR index,
++        PWINUSB_INTERFACE_HANDLE ret)
++{
++    struct interface *iface, *assoc;
++    unsigned int target;
++
++    TRACE("handle %p, index %u, ret %p.\n", handle, index, ret);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!ret)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    target = iface->index + 1 + index;
++    if (target >= iface->device->info->interface_count)
++    {
++        SetLastError(ERROR_NO_MORE_ITEMS);
++        return FALSE;
++    }
++
++    if (!(assoc = create_interface(iface->device, target)))
++    {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    *ret = assoc;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_QueryInterfaceSettings (winusb.@)
++ */
++BOOL WINAPI WinUsb_QueryInterfaceSettings(WINUSB_INTERFACE_HANDLE handle, UCHAR alt,
++        PUSB_INTERFACE_DESCRIPTOR desc)
++{
++    const USB_INTERFACE_DESCRIPTOR *found;
++    struct interface *iface;
++
++    TRACE("handle %p, alt %u, desc %p.\n", handle, alt, desc);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!desc)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    if (!(found = find_interface_desc(iface->device, iface->number, alt)))
++    {
++        SetLastError(ERROR_NO_MORE_ITEMS);
++        return FALSE;
++    }
++    memcpy(desc, found, sizeof(*desc));
++    return TRUE;
++}
++
++static BOOL query_pipe(WINUSB_INTERFACE_HANDLE handle, UCHAR alt, UCHAR index, WINUSB_PIPE_INFORMATION_EX *info)
++{
++    const USB_INTERFACE_DESCRIPTOR *desc;
++    const USB_ENDPOINT_DESCRIPTOR *ep;
++    struct interface *iface;
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!info)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    if (!(desc = find_interface_desc(iface->device, iface->number, alt))
++            || !(ep = find_endpoint_desc(iface->device, desc, index)))
++    {
++        SetLastError(ERROR_NO_MORE_ITEMS);
++        return FALSE;
++    }
++
++    info->PipeType = ep->bmAttributes & USB_ENDPOINT_TYPE_MASK;
++    info->PipeId = ep->bEndpointAddress;
++    info->MaximumPacketSize = ep->wMaxPacketSize & 0x7ff;
++    info->Interval = ep->bInterval;
++    info->MaximumBytesPerInterval = (ep->wMaxPacketSize & 0x7ff) * (((ep->wMaxPacketSize >> 11) & 3) + 1);
++    TRACE("pipe %#x, type %u, max packet %u.\n", info->PipeId, info->PipeType, info->MaximumPacketSize);
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_QueryPipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_QueryPipe(WINUSB_INTERFACE_HANDLE handle, UCHAR alt, UCHAR index,
++        PWINUSB_PIPE_INFORMATION info)
++{
++    WINUSB_PIPE_INFORMATION_EX info_ex;
++
++    TRACE("handle %p, alt %u, index %u, info %p.\n", handle, alt, index, info);
++
++    if (!info)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (!query_pipe(handle, alt, index, &info_ex))
++        return FALSE;
++
++    info->PipeType = info_ex.PipeType;
++    info->PipeId = info_ex.PipeId;
++    info->MaximumPacketSize = info_ex.MaximumPacketSize;
++    info->Interval = info_ex.Interval;
+     return TRUE;
+ }
++
++/***********************************************************************
++ *           WinUsb_QueryPipeEx (winusb.@)
++ */
++BOOL WINAPI WinUsb_QueryPipeEx(WINUSB_INTERFACE_HANDLE handle, UCHAR alt, UCHAR index,
++        PWINUSB_PIPE_INFORMATION_EX info)
++{
++    TRACE("handle %p, alt %u, index %u, info %p.\n", handle, alt, index, info);
++    return query_pipe(handle, alt, index, info);
++}
++
++static BOOL control_transfer(struct interface *iface, WINUSB_SETUP_PACKET setup, UCHAR *buffer,
++        ULONG length, ULONG *ret_len, OVERLAPPED *ov)
++{
++    struct wine_winusb_control *header;
++    ULONG transferred = 0;
++    BOOL in = !!(setup.RequestType & 0x80), ret;
++    USHORT data_len;
++
++    data_len = buffer ? min(setup.Length, length) : 0;
++    setup.Length = data_len;
++
++    /* WinUSB directs interface requests to the interface of the handle. */
++    if ((setup.RequestType & 0x1f) == 1)
++        setup.Index = (setup.Index & 0xff00) | iface->number;
++
++    TRACE("setup {%02x %02x %04x %04x %04x}.\n", setup.RequestType, setup.Request,
++            setup.Value, setup.Index, setup.Length);
++
++    if (!(header = malloc(sizeof(*header) + (in ? 0 : data_len))))
++    {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    memset(header, 0, sizeof(*header));
++    memcpy(header->setup, &setup, sizeof(header->setup));
++    if (!in && data_len)
++        memcpy(header + 1, buffer, data_len);
++
++    ret = do_ioctl(iface->device, IOCTL_WINE_WINUSB_CONTROL, header, sizeof(*header) + (in ? 0 : data_len),
++            in ? buffer : NULL, in ? data_len : 0, &transferred, ov, iface->policies[0].timeout);
++    free(header);
++
++    if (ret_len) *ret_len = transferred;
++    return ret;
++}
++
++/***********************************************************************
++ *           WinUsb_ControlTransfer (winusb.@)
++ */
++BOOL WINAPI WinUsb_ControlTransfer(WINUSB_INTERFACE_HANDLE handle, WINUSB_SETUP_PACKET setup,
++        PUCHAR buffer, ULONG length, PULONG ret_len, LPOVERLAPPED ov)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, buffer %p, length %lu, ret_len %p, ov %p.\n", handle, buffer, length, ret_len, ov);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    return control_transfer(iface, setup, buffer, length, ret_len, ov);
++}
++
++/***********************************************************************
++ *           WinUsb_GetDescriptor (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetDescriptor(WINUSB_INTERFACE_HANDLE handle, UCHAR type, UCHAR index,
++        USHORT lang, PUCHAR buffer, ULONG length, PULONG ret_len)
++{
++    struct wine_winusb_info *info;
++    WINUSB_SETUP_PACKET setup;
++    struct interface *iface;
++    ULONG len;
++
++    TRACE("handle %p, type %#x, index %u, lang %#x, buffer %p, length %lu, ret_len %p.\n",
++            handle, type, index, lang, buffer, length, ret_len);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!buffer || !ret_len)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    info = iface->device->info;
++
++    if (type == USB_DEVICE_DESCRIPTOR_TYPE)
++    {
++        len = min(length, sizeof(info->device_descriptor));
++        memcpy(buffer, info->device_descriptor, len);
++        *ret_len = len;
++        return TRUE;
++    }
++    if (type == USB_CONFIGURATION_DESCRIPTOR_TYPE && !index)
++    {
++        len = min(length, info->config_length);
++        memcpy(buffer, iface->device->config, len);
++        *ret_len = len;
++        return TRUE;
++    }
++
++    setup.RequestType = 0x80;
++    setup.Request = 6; /* GET_DESCRIPTOR */
++    setup.Value = (type << 8) | index;
++    setup.Index = lang;
++    setup.Length = min(length, 0xffff);
++    return control_transfer(iface, setup, buffer, length, ret_len, NULL);
++}
++
++static BOOL check_pipe(struct interface *iface, UCHAR pipe, BOOL in)
++{
++    const USB_ENDPOINT_DESCRIPTOR *ep;
++
++    if (!(ep = find_pipe_desc(iface, pipe)) || !!(pipe & 0x80) != in)
++    {
++        WARN("Invalid pipe %#x.\n", pipe);
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_ReadPipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_ReadPipe(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe, PUCHAR buffer,
++        ULONG length, PULONG ret_len, LPOVERLAPPED ov)
++{
++    struct wine_winusb_transfer header = {0};
++    struct pipe_policy *policy;
++    struct interface *iface;
++    ULONG transferred = 0;
++    BOOL ret;
++
++    TRACE("handle %p, pipe %#x, buffer %p, length %lu, ret_len %p, ov %p.\n",
++            handle, pipe, buffer, length, ret_len, ov);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!check_pipe(iface, pipe, TRUE))
++        return FALSE;
++    if (!buffer && length)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    policy = get_policy(iface, pipe);
++
++    header.pipe = pipe;
++    header.flags = WINE_WINUSB_FLAG_SHORT_OK;
++    header.length = length;
++
++    ret = do_ioctl(iface->device, IOCTL_WINE_WINUSB_READ_PIPE, &header, sizeof(header),
++            buffer, length, &transferred, ov, policy->timeout);
++
++    TRACE("ret %d, transferred %lu, error %lu.\n", ret, transferred, ret ? 0 : GetLastError());
++
++    if (!ret && !ov && GetLastError() != ERROR_IO_PENDING && policy->auto_clear_stall)
++        WinUsb_ResetPipe(handle, pipe);
++
++    if (ret_len) *ret_len = transferred;
++    return ret;
++}
++
++/***********************************************************************
++ *           WinUsb_WritePipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_WritePipe(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe, PUCHAR buffer,
++        ULONG length, PULONG ret_len, LPOVERLAPPED ov)
++{
++    struct wine_winusb_transfer *header;
++    struct pipe_policy *policy;
++    struct interface *iface;
++    ULONG transferred = 0;
++    BOOL ret;
++
++    TRACE("handle %p, pipe %#x, buffer %p, length %lu, ret_len %p, ov %p.\n",
++            handle, pipe, buffer, length, ret_len, ov);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!check_pipe(iface, pipe, FALSE))
++        return FALSE;
++    if (!buffer && length)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    policy = get_policy(iface, pipe);
++
++    /* The input buffer is copied when the request is queued, so it can be
++     * freed right away even for overlapped requests. */
++    if (!(header = malloc(sizeof(*header) + length)))
++    {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++        return FALSE;
++    }
++    memset(header, 0, sizeof(*header));
++    header->pipe = pipe;
++    header->length = length;
++    if (policy->short_packet_terminate)
++        header->flags |= WINE_WINUSB_FLAG_ZLP;
++    if (length)
++        memcpy(header + 1, buffer, length);
++
++    ret = do_ioctl(iface->device, IOCTL_WINE_WINUSB_WRITE_PIPE, header, sizeof(*header) + length,
++            NULL, 0, &transferred, ov, policy->timeout);
++    free(header);
++
++    TRACE("ret %d, transferred %lu, error %lu.\n", ret, transferred, ret ? 0 : GetLastError());
++
++    if (!ret && !ov && GetLastError() != ERROR_IO_PENDING && policy->auto_clear_stall)
++        WinUsb_ResetPipe(handle, pipe);
++
++    if (ret_len) *ret_len = transferred;
++    return ret;
++}
++
++static BOOL pipe_request(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe, DWORD code)
++{
++    struct wine_winusb_pipe header = {0};
++    struct interface *iface;
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!find_pipe_desc(iface, pipe))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++
++    header.pipe = pipe;
++    return do_ioctl(iface->device, code, &header, sizeof(header), NULL, 0, NULL, NULL, 0);
++}
++
++/***********************************************************************
++ *           WinUsb_AbortPipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_AbortPipe(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe)
++{
++    TRACE("handle %p, pipe %#x.\n", handle, pipe);
++    return pipe_request(handle, pipe, IOCTL_WINE_WINUSB_ABORT_PIPE);
++}
++
++/***********************************************************************
++ *           WinUsb_ResetPipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_ResetPipe(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe)
++{
++    TRACE("handle %p, pipe %#x.\n", handle, pipe);
++    return pipe_request(handle, pipe, IOCTL_WINE_WINUSB_RESET_PIPE);
++}
++
++/***********************************************************************
++ *           WinUsb_FlushPipe (winusb.@)
++ */
++BOOL WINAPI WinUsb_FlushPipe(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, pipe %#x.\n", handle, pipe);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    /* Nothing is cached by this implementation. */
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_GetOverlappedResult (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetOverlappedResult(WINUSB_INTERFACE_HANDLE handle, LPOVERLAPPED ov,
++        LPDWORD ret_len, BOOL wait)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, ov %p, ret_len %p, wait %d.\n", handle, ov, ret_len, wait);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    return GetOverlappedResult(iface->device->file, ov, ret_len, wait);
++}
++
++/* boolean policies are passed as a single UCHAR */
++static BOOL set_flag(BOOL *dst, ULONG length, const void *value)
++{
++    if (!value || length < sizeof(UCHAR))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    *dst = !!*(const UCHAR *)value;
++    return TRUE;
++}
++
++static BOOL set_ulong(ULONG *dst, ULONG length, const void *value)
++{
++    if (!value || length < sizeof(ULONG))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    memcpy(dst, value, sizeof(ULONG));
++    return TRUE;
++}
++
++static BOOL get_value(const void *src, ULONG size, ULONG *length, void *value)
++{
++    if (!length || !value)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (*length < size)
++    {
++        *length = size;
++        SetLastError(ERROR_INSUFFICIENT_BUFFER);
++        return FALSE;
++    }
++    memcpy(value, src, size);
++    *length = size;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_SetPipePolicy (winusb.@)
++ */
++BOOL WINAPI WinUsb_SetPipePolicy(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe, ULONG type,
++        ULONG length, PVOID value)
++{
++    struct pipe_policy *policy;
++    struct interface *iface;
++
++    TRACE("handle %p, pipe %#x, type %#lx, length %lu, value %p.\n", handle, pipe, type, length, value);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    policy = get_policy(iface, pipe);
++
++    switch (type)
++    {
++        case SHORT_PACKET_TERMINATE: return set_flag(&policy->short_packet_terminate, length, value);
++        case AUTO_CLEAR_STALL:       return set_flag(&policy->auto_clear_stall, length, value);
++        case IGNORE_SHORT_PACKETS:   return set_flag(&policy->ignore_short_packets, length, value);
++        case ALLOW_PARTIAL_READS:    return set_flag(&policy->allow_partial_reads, length, value);
++        case AUTO_FLUSH:             return set_flag(&policy->auto_flush, length, value);
++        case RAW_IO:                 return set_flag(&policy->raw_io, length, value);
++        case RESET_PIPE_ON_RESUME:   return set_flag(&policy->reset_pipe_on_resume, length, value);
++        case PIPE_TRANSFER_TIMEOUT:  return set_ulong(&policy->timeout, length, value);
++    }
++
++    FIXME("Unhandled policy %#lx.\n", type);
++    SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++}
++
++/***********************************************************************
++ *           WinUsb_GetPipePolicy (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetPipePolicy(WINUSB_INTERFACE_HANDLE handle, UCHAR pipe, ULONG type,
++        PULONG length, PVOID value)
++{
++    static const ULONG max_transfer = REPORTED_MAX_TRANSFER_SIZE;
++    struct pipe_policy *policy;
++    struct interface *iface;
++    UCHAR flag;
++
++    TRACE("handle %p, pipe %#x, type %#lx, length %p, value %p.\n", handle, pipe, type, length, value);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    policy = get_policy(iface, pipe);
++
++    switch (type)
++    {
++        case SHORT_PACKET_TERMINATE: flag = policy->short_packet_terminate; break;
++        case AUTO_CLEAR_STALL:       flag = policy->auto_clear_stall; break;
++        case IGNORE_SHORT_PACKETS:   flag = policy->ignore_short_packets; break;
++        case ALLOW_PARTIAL_READS:    flag = policy->allow_partial_reads; break;
++        case AUTO_FLUSH:             flag = policy->auto_flush; break;
++        case RAW_IO:                 flag = policy->raw_io; break;
++        case RESET_PIPE_ON_RESUME:   flag = policy->reset_pipe_on_resume; break;
++        case PIPE_TRANSFER_TIMEOUT:  return get_value(&policy->timeout, sizeof(ULONG), length, value);
++        case MAXIMUM_TRANSFER_SIZE:  return get_value(&max_transfer, sizeof(ULONG), length, value);
++        default:
++            FIXME("Unhandled policy %#lx.\n", type);
++            SetLastError(ERROR_INVALID_PARAMETER);
++            return FALSE;
++    }
++    return get_value(&flag, sizeof(flag), length, value);
++}
++
++/***********************************************************************
++ *           WinUsb_SetPowerPolicy (winusb.@)
++ */
++BOOL WINAPI WinUsb_SetPowerPolicy(WINUSB_INTERFACE_HANDLE handle, ULONG type, ULONG length, PVOID value)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, type %#lx, length %lu, value %p.\n", handle, type, length, value);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++
++    switch (type)
++    {
++        case AUTO_SUSPEND:
++            if (!value || length < 1) break;
++            iface->auto_suspend = *(UCHAR *)value;
++            return TRUE;
++        case SUSPEND_DELAY:
++            return set_ulong(&iface->suspend_delay, length, value);
++    }
++
++    SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++}
++
++/***********************************************************************
++ *           WinUsb_GetPowerPolicy (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetPowerPolicy(WINUSB_INTERFACE_HANDLE handle, ULONG type, PULONG length, PVOID value)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, type %#lx, length %p, value %p.\n", handle, type, length, value);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++
++    switch (type)
++    {
++        case AUTO_SUSPEND:  return get_value(&iface->auto_suspend, sizeof(UCHAR), length, value);
++        case SUSPEND_DELAY: return get_value(&iface->suspend_delay, sizeof(ULONG), length, value);
++    }
++
++    SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++}
++
++/***********************************************************************
++ *           WinUsb_QueryDeviceInformation (winusb.@)
++ */
++BOOL WINAPI WinUsb_QueryDeviceInformation(WINUSB_INTERFACE_HANDLE handle, ULONG type, PULONG length, PVOID value)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, type %#lx, length %p, value %p.\n", handle, type, length, value);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++
++    if (type == DEVICE_SPEED)
++        return get_value(&iface->device->info->speed, sizeof(UCHAR), length, value);
++
++    SetLastError(ERROR_INVALID_PARAMETER);
++    return FALSE;
++}
++
++/***********************************************************************
++ *           WinUsb_GetCurrentAlternateSetting (winusb.@)
++ */
++BOOL WINAPI WinUsb_GetCurrentAlternateSetting(WINUSB_INTERFACE_HANDLE handle, PUCHAR alt)
++{
++    struct interface *iface;
++
++    TRACE("handle %p, alt %p.\n", handle, alt);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!alt)
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    *alt = iface->alt;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_SetCurrentAlternateSetting (winusb.@)
++ */
++BOOL WINAPI WinUsb_SetCurrentAlternateSetting(WINUSB_INTERFACE_HANDLE handle, UCHAR alt)
++{
++    const USB_INTERFACE_DESCRIPTOR *desc;
++    WINUSB_SETUP_PACKET setup;
++    struct interface *iface;
++
++    TRACE("handle %p, alt %u.\n", handle, alt);
++
++    if (!(iface = get_interface(handle)))
++        return FALSE;
++    if (!(desc = find_interface_desc(iface->device, iface->number, alt)))
++    {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return FALSE;
++    }
++    if (alt == iface->alt)
++        return TRUE;
++
++    setup.RequestType = 0x01;
++    setup.Request = 11; /* SET_INTERFACE */
++    setup.Value = desc->bAlternateSetting;
++    setup.Index = iface->number;
++    setup.Length = 0;
++    if (!control_transfer(iface, setup, NULL, 0, NULL, NULL))
++        return FALSE;
++    iface->alt = alt;
++    return TRUE;
++}
++
++/***********************************************************************
++ *           WinUsb_ParseConfigurationDescriptor (winusb.@)
++ */
++PUSB_INTERFACE_DESCRIPTOR WINAPI WinUsb_ParseConfigurationDescriptor(PUSB_CONFIGURATION_DESCRIPTOR config,
++        PVOID start, LONG number, LONG alt, LONG class, LONG subclass, LONG protocol)
++{
++    const UCHAR *ptr = start, *end;
++
++    TRACE("config %p, start %p, number %ld, alt %ld, class %ld, subclass %ld, protocol %ld.\n",
++            config, start, number, alt, class, subclass, protocol);
++
++    if (!config) return NULL;
++    end = (const UCHAR *)config + config->wTotalLength;
++    if (!ptr) ptr = (const UCHAR *)config;
++
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == USB_INTERFACE_DESCRIPTOR_TYPE && ptr[0] >= sizeof(USB_INTERFACE_DESCRIPTOR))
++        {
++            USB_INTERFACE_DESCRIPTOR *desc = (USB_INTERFACE_DESCRIPTOR *)ptr;
++
++            if ((number == -1 || desc->bInterfaceNumber == number)
++                    && (alt == -1 || desc->bAlternateSetting == alt)
++                    && (class == -1 || desc->bInterfaceClass == class)
++                    && (subclass == -1 || desc->bInterfaceSubClass == subclass)
++                    && (protocol == -1 || desc->bInterfaceProtocol == protocol))
++                return desc;
++        }
++        ptr += ptr[0];
++    }
++    return NULL;
++}
++
++/***********************************************************************
++ *           WinUsb_ParseDescriptors (winusb.@)
++ */
++PUSB_COMMON_DESCRIPTOR WINAPI WinUsb_ParseDescriptors(PVOID buffer, ULONG length, PVOID start, LONG type)
++{
++    const UCHAR *ptr = start, *end = (const UCHAR *)buffer + length;
++
++    TRACE("buffer %p, length %lu, start %p, type %ld.\n", buffer, length, start, type);
++
++    if (!buffer) return NULL;
++    if (!ptr) ptr = buffer;
++
++    while (ptr + 2 <= end && ptr[0] >= 2 && ptr + ptr[0] <= end)
++    {
++        if (ptr[1] == type)
++            return (PUSB_COMMON_DESCRIPTOR)ptr;
++        ptr += ptr[0];
++    }
++    return NULL;
++}
+diff --git a/dlls/winusb/winusb.spec b/dlls/winusb/winusb.spec
+index a0b57d5..4c7de6d 100644
+--- a/dlls/winusb/winusb.spec
++++ b/dlls/winusb/winusb.spec
+@@ -1,22 +1,34 @@
+-@ stub WinUsb_AbortPipe
+-@ stub WinUsb_ControlTransfer
+-@ stub WinUsb_FlushPipe
++@ stdcall WinUsb_AbortPipe(ptr long)
++@ stdcall WinUsb_ControlTransfer(ptr int64 ptr long ptr ptr)
++@ stdcall WinUsb_FlushPipe(ptr long)
+ @ stdcall WinUsb_Free(ptr)
+-@ stub WinUsb_GetAssociatedInterface
+-@ stub WinUsb_GetCurrentAlternateSetting
+-@ stub WinUsb_GetDescriptor
+-@ stub WinUsb_GetOverlappedResult
+-@ stub WinUsb_GetPipePolicy
+-@ stub WinUsb_GetPowerPolicy
+-@ stub WinUsb_Initialize
+-@ stub WinUsb_ParseConfigurationDescriptor
+-@ stub WinUsb_ParseDescriptors
+-@ stub WinUsb_QueryDeviceInformation
+-@ stub WinUsb_QueryInterfaceSettings
+-@ stub WinUsb_QueryPipe
+-@ stub WinUsb_ReadPipe
+-@ stub WinUsb_ResetPipe
+-@ stub WinUsb_SetCurrentAlternateSetting
+-@ stub WinUsb_SetPipePolicy
+-@ stub WinUsb_SetPowerPolicy
+-@ stub WinUsb_WritePipe
++@ stub WinUsb_GetAdjustedFrameNumber
++@ stdcall WinUsb_GetAssociatedInterface(ptr long ptr)
++@ stdcall WinUsb_GetCurrentAlternateSetting(ptr ptr)
++@ stub WinUsb_GetCurrentFrameNumber
++@ stub WinUsb_GetCurrentFrameNumberAndQpc
++@ stdcall WinUsb_GetDescriptor(ptr long long long ptr long ptr)
++@ stdcall WinUsb_GetOverlappedResult(ptr ptr ptr long)
++@ stdcall WinUsb_GetPipePolicy(ptr long long ptr ptr)
++@ stdcall WinUsb_GetPowerPolicy(ptr long ptr ptr)
++@ stdcall WinUsb_Initialize(ptr ptr)
++@ stdcall WinUsb_ParseConfigurationDescriptor(ptr ptr long long long long long)
++@ stdcall WinUsb_ParseDescriptors(ptr long ptr long)
++@ stdcall WinUsb_QueryDeviceInformation(ptr long ptr ptr)
++@ stdcall WinUsb_QueryInterfaceSettings(ptr long ptr)
++@ stdcall WinUsb_QueryPipe(ptr long long ptr)
++@ stdcall WinUsb_QueryPipeEx(ptr long long ptr)
++@ stub WinUsb_ReadIsochPipe
++@ stub WinUsb_ReadIsochPipeAsap
++@ stdcall WinUsb_ReadPipe(ptr long ptr long ptr ptr)
++@ stub WinUsb_RegisterIsochBuffer
++@ stdcall WinUsb_ResetPipe(ptr long)
++@ stdcall WinUsb_SetCurrentAlternateSetting(ptr long)
++@ stdcall WinUsb_SetPipePolicy(ptr long long long ptr)
++@ stdcall WinUsb_SetPowerPolicy(ptr long long ptr)
++@ stub WinUsb_StartTrackingForTimeSync
++@ stub WinUsb_StopTrackingForTimeSync
++@ stub WinUsb_UnregisterIsochBuffer
++@ stub WinUsb_WriteIsochPipe
++@ stub WinUsb_WriteIsochPipeAsap
++@ stdcall WinUsb_WritePipe(ptr long ptr long ptr ptr)
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 3f23c63..1cf1bbd 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1160,6 +1160,7 @@ SOURCES = \
+ 	wine/winedxgi.idl \
+ 	wine/wingdi16.h \
+ 	wine/winnet16.h \
++	wine/winusb_ioctl.h \
+ 	wine/winuser16.h \
+ 	winerror.h \
+ 	winevt.h \
+@@ -1194,6 +1195,7 @@ SOURCES = \
+ 	winternl.h \
+ 	wintrust.h \
+ 	winusb.h \
++	winusbio.h \
+ 	winuser.h \
+ 	winuser.rh \
+ 	winver.h \
+diff --git a/include/ddk/usb100.h b/include/ddk/usb100.h
+index d8d3ca9..998e499 100644
+--- a/include/ddk/usb100.h
++++ b/include/ddk/usb100.h
+@@ -48,6 +48,10 @@ typedef struct _USB_DEVICE_DESCRIPTOR {
+ } USB_DEVICE_DESCRIPTOR;
+ typedef struct _USB_DEVICE_DESCRIPTOR *PUSB_DEVICE_DESCRIPTOR;
+ 
++#define USB_ENDPOINT_DIRECTION_MASK       0x80
++#define USB_ENDPOINT_DIRECTION_OUT(x)     (!((x) & USB_ENDPOINT_DIRECTION_MASK))
++#define USB_ENDPOINT_DIRECTION_IN(x)      ((x) & USB_ENDPOINT_DIRECTION_MASK)
++
+ #define USB_ENDPOINT_TYPE_MASK            0x03
+ #define USB_ENDPOINT_TYPE_CONTROL         0x00
+ #define USB_ENDPOINT_TYPE_ISOCHRONOUS     0x01
+diff --git a/include/wine/winusb_ioctl.h b/include/wine/winusb_ioctl.h
+new file mode 100644
+index 0000000..eef8091
+--- /dev/null
++++ b/include/wine/winusb_ioctl.h
+@@ -0,0 +1,75 @@
++/*
++ * Private interface between winusb.dll and winusb.sys
++ *
++ * Copyright 2026 ciroprogamer
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_WINUSB_IOCTL_H
++#define __WINE_WINUSB_IOCTL_H
++
++#include "winioctl.h"
++
++/* All structures are pointer-free and fixed-size so that 32-bit clients
++ * can talk to the 64-bit driver. */
++
++#define IOCTL_WINE_WINUSB_GET_INFO    CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa00, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_WINE_WINUSB_CONTROL     CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa01, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_WINE_WINUSB_READ_PIPE   CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa02, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_WINE_WINUSB_WRITE_PIPE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa03, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_WINE_WINUSB_ABORT_PIPE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa04, METHOD_BUFFERED, FILE_ANY_ACCESS)
++#define IOCTL_WINE_WINUSB_RESET_PIPE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0xa05, METHOD_BUFFERED, FILE_ANY_ACCESS)
++
++#define WINE_WINUSB_MAX_INTERFACES 32
++
++struct wine_winusb_info
++{
++    UINT32 size;            /* total size of the valid data, including config descriptor */
++    UINT8  speed;           /* LowSpeed / FullSpeed / HighSpeed */
++    UINT8  interface_count; /* interfaces exposed through this device object */
++    UINT16 config_length;
++    UINT8  interfaces[WINE_WINUSB_MAX_INTERFACES]; /* bInterfaceNumber values, default first */
++    UINT8  device_descriptor[18];
++    UINT8  reserved[2];
++    /* followed by config_length bytes of configuration descriptor */
++};
++
++#define WINE_WINUSB_FLAG_ZLP          0x01  /* terminate write with a zero length packet if needed */
++#define WINE_WINUSB_FLAG_SHORT_OK     0x02  /* (reads) short packet completes the transfer (default) */
++
++struct wine_winusb_transfer
++{
++    UINT8  pipe;            /* endpoint address */
++    UINT8  flags;
++    UINT16 reserved;
++    UINT32 length;
++    /* followed by length bytes of data for writes */
++};
++
++struct wine_winusb_control
++{
++    UINT8  setup[8];
++    UINT32 reserved;
++    /* followed by wLength bytes of data for host-to-device transfers */
++};
++
++struct wine_winusb_pipe
++{
++    UINT8  pipe;
++    UINT8  reserved[3];
++};
++
++#endif /* __WINE_WINUSB_IOCTL_H */
+diff --git a/include/winusb.h b/include/winusb.h
+index 77b686b..607c677 100644
+--- a/include/winusb.h
++++ b/include/winusb.h
+@@ -1,5 +1,6 @@
+ /*
+  * Copyright (C) 2022 Mohamad Al-Jaf
++ * Copyright 2026 ciroprogamer
+  *
+  * This library is free software; you can redistribute it and/or
+  * modify it under the terms of the GNU Lesser General Public
+@@ -19,13 +20,37 @@
+ #ifndef _WINUSB_H_
+ #define _WINUSB_H_
+ 
++#include <winusbio.h>
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+ typedef PVOID WINUSB_INTERFACE_HANDLE, *PWINUSB_INTERFACE_HANDLE;
+ 
++BOOL WINAPI WinUsb_AbortPipe(WINUSB_INTERFACE_HANDLE,UCHAR);
++BOOL WINAPI WinUsb_ControlTransfer(WINUSB_INTERFACE_HANDLE,WINUSB_SETUP_PACKET,PUCHAR,ULONG,PULONG,LPOVERLAPPED);
++BOOL WINAPI WinUsb_FlushPipe(WINUSB_INTERFACE_HANDLE,UCHAR);
+ BOOL WINAPI WinUsb_Free(WINUSB_INTERFACE_HANDLE);
++BOOL WINAPI WinUsb_GetAssociatedInterface(WINUSB_INTERFACE_HANDLE,UCHAR,PWINUSB_INTERFACE_HANDLE);
++BOOL WINAPI WinUsb_GetCurrentAlternateSetting(WINUSB_INTERFACE_HANDLE,PUCHAR);
++BOOL WINAPI WinUsb_GetDescriptor(WINUSB_INTERFACE_HANDLE,UCHAR,UCHAR,USHORT,PUCHAR,ULONG,PULONG);
++BOOL WINAPI WinUsb_GetOverlappedResult(WINUSB_INTERFACE_HANDLE,LPOVERLAPPED,LPDWORD,BOOL);
++BOOL WINAPI WinUsb_GetPipePolicy(WINUSB_INTERFACE_HANDLE,UCHAR,ULONG,PULONG,PVOID);
++BOOL WINAPI WinUsb_GetPowerPolicy(WINUSB_INTERFACE_HANDLE,ULONG,PULONG,PVOID);
++BOOL WINAPI WinUsb_Initialize(HANDLE,PWINUSB_INTERFACE_HANDLE);
++PUSB_INTERFACE_DESCRIPTOR WINAPI WinUsb_ParseConfigurationDescriptor(PUSB_CONFIGURATION_DESCRIPTOR,PVOID,LONG,LONG,LONG,LONG,LONG);
++PUSB_COMMON_DESCRIPTOR WINAPI WinUsb_ParseDescriptors(PVOID,ULONG,PVOID,LONG);
++BOOL WINAPI WinUsb_QueryDeviceInformation(WINUSB_INTERFACE_HANDLE,ULONG,PULONG,PVOID);
++BOOL WINAPI WinUsb_QueryInterfaceSettings(WINUSB_INTERFACE_HANDLE,UCHAR,PUSB_INTERFACE_DESCRIPTOR);
++BOOL WINAPI WinUsb_QueryPipe(WINUSB_INTERFACE_HANDLE,UCHAR,UCHAR,PWINUSB_PIPE_INFORMATION);
++BOOL WINAPI WinUsb_QueryPipeEx(WINUSB_INTERFACE_HANDLE,UCHAR,UCHAR,PWINUSB_PIPE_INFORMATION_EX);
++BOOL WINAPI WinUsb_ReadPipe(WINUSB_INTERFACE_HANDLE,UCHAR,PUCHAR,ULONG,PULONG,LPOVERLAPPED);
++BOOL WINAPI WinUsb_ResetPipe(WINUSB_INTERFACE_HANDLE,UCHAR);
++BOOL WINAPI WinUsb_SetCurrentAlternateSetting(WINUSB_INTERFACE_HANDLE,UCHAR);
++BOOL WINAPI WinUsb_SetPipePolicy(WINUSB_INTERFACE_HANDLE,UCHAR,ULONG,ULONG,PVOID);
++BOOL WINAPI WinUsb_SetPowerPolicy(WINUSB_INTERFACE_HANDLE,ULONG,ULONG,PVOID);
++BOOL WINAPI WinUsb_WritePipe(WINUSB_INTERFACE_HANDLE,UCHAR,PUCHAR,ULONG,PULONG,LPOVERLAPPED);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/include/winusbio.h b/include/winusbio.h
+new file mode 100644
+index 0000000..4f9b225
+--- /dev/null
++++ b/include/winusbio.h
+@@ -0,0 +1,77 @@
++/*
++ * Copyright 2026 ciroprogamer
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
++ */
++
++#ifndef __WINE_WINUSBIO_H
++#define __WINE_WINUSBIO_H
++
++#ifndef _WDMDDK_
++/* user mode: the URB structures in usb.h only need an opaque MDL pointer */
++typedef struct _MDL *PMDL;
++#endif
++#include <ddk/usb.h>
++
++/* pipe policies */
++#define SHORT_PACKET_TERMINATE  0x01
++#define AUTO_CLEAR_STALL        0x02
++#define PIPE_TRANSFER_TIMEOUT   0x03
++#define IGNORE_SHORT_PACKETS    0x04
++#define ALLOW_PARTIAL_READS     0x05
++#define AUTO_FLUSH              0x06
++#define RAW_IO                  0x07
++#define MAXIMUM_TRANSFER_SIZE   0x08
++#define RESET_PIPE_ON_RESUME    0x09
++
++/* power policies */
++#define AUTO_SUSPEND            0x81
++#define SUSPEND_DELAY           0x83
++
++/* device information */
++#define DEVICE_SPEED            0x01
++#define LowSpeed                0x01
++#define FullSpeed               0x02
++#define HighSpeed               0x03
++
++typedef struct _WINUSB_PIPE_INFORMATION
++{
++    USBD_PIPE_TYPE PipeType;
++    UCHAR PipeId;
++    USHORT MaximumPacketSize;
++    UCHAR Interval;
++} WINUSB_PIPE_INFORMATION, *PWINUSB_PIPE_INFORMATION;
++
++typedef struct _WINUSB_PIPE_INFORMATION_EX
++{
++    USBD_PIPE_TYPE PipeType;
++    UCHAR PipeId;
++    USHORT MaximumPacketSize;
++    UCHAR Interval;
++    ULONG MaximumBytesPerInterval;
++} WINUSB_PIPE_INFORMATION_EX, *PWINUSB_PIPE_INFORMATION_EX;
++
++#include <pshpack1.h>
++typedef struct _WINUSB_SETUP_PACKET
++{
++    UCHAR RequestType;
++    UCHAR Request;
++    USHORT Value;
++    USHORT Index;
++    USHORT Length;
++} WINUSB_SETUP_PACKET, *PWINUSB_SETUP_PACKET;
++#include <poppack.h>
++
++#endif /* __WINE_WINUSBIO_H */

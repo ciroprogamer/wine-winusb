@@ -1,0 +1,3 @@
+lib/** binary
+*.exe binary
+*.patch -text
