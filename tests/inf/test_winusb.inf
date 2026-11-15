@@ -7,9 +7,13 @@ Provider    = %Provider%
 DriverVer   = 11/15/2026,1.0.0.0
 
 [Manufacturer]
-%Provider% = Devices, NTamd64
+%Provider% = Devices, NTamd64, NTx86
 
 [Devices.NTamd64]
+%Fastboot% = USB_Install, USB\VID_18D1&PID_D00D
+%Hdb%      = USB_Install, USB\VID_12D1&PID_1052&MI_01
+
+[Devices.NTx86]
 %Fastboot% = USB_Install, USB\VID_18D1&PID_D00D
 %Hdb%      = USB_Install, USB\VID_12D1&PID_1052&MI_01
 

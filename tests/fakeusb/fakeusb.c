@@ -3,6 +3,21 @@
  * Used to test Wine's USB stack end to end without real hardware.
  *
  * Implements the subset of libusb used by Wine's wineusb.so.
+ *
+ * Environment:
+ *   FAKEUSB_LOG              log file
+ *   FAKEUSB_COMPOSITE        composite Huawei phone (12d1:1052), HDB on MI_01
+ *   FAKEUSB_ALT              interface 0 has a second alternate setting with
+ *                            endpoints 0x82/0x02 instead of 0x81/0x01
+ *   FAKEUSB_SPEED            low, full, high (default) or super
+ *   FAKEUSB_FAIL_SUBMIT      submitting the 4 byte write "fail" fails
+ *   FAKEUSB_UNPLUG_LATE      on "unplug", report the removal first and
+ *                            finish the pending transfers 300 ms later
+ *   FAKEUSB_CANCEL_COMPLETES a cancelled read completes with data instead,
+ *                            as if it had finished just before the cancel
+ *
+ * Lines starting with "FAKEUSB ERROR" in the log mean that the USB stack
+ * broke a libusb rule; the test script treats them as failures.
  */
 #include <libusb.h>
 #include <pthread.h>
@@ -25,6 +40,18 @@ static struct libusb_device_handle fake_handle = { &fake_dev };
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 static int interrupted;
+
+static libusb_hotplug_callback_fn hotplug_cb;
+static void *hotplug_data;
+
+static int unplug_requested;    /* the "unplug" command was received */
+static int gone;                /* the device has been unplugged */
+static int late_completion;     /* pending transfers still have to fail */
+static struct timespec late_time;
+
+static int claimed;             /* bitmask of interfaces claimed through libusb */
+static int host_alt;            /* alternate setting the host side knows about */
+static int halted;              /* the IN endpoint is stalled */
 
 static FILE *logf;
 static void flog(const char *fmt, ...)
@@ -83,12 +110,19 @@ static void match_in(void)
     {
         struct libusb_transfer *t = pending_in[0];
         struct response r = responses[0];
-        int len = r.len < t->length ? r.len : t->length;
 
         memmove(pending_in, pending_in + 1, --pending_count * sizeof(*pending_in));
         memmove(responses, responses + 1, --response_count * sizeof(*responses));
-        memcpy(t->buffer, r.data, len);
-        queue_done(t, LIBUSB_TRANSFER_COMPLETED, len);
+        if (r.len > t->length)
+        {
+            /* like a real host controller: the packet does not fit in the
+             * transfer, which fails, and the data is lost */
+            flog("device: %d byte packet overflows %d byte transfer\n", r.len, t->length);
+            queue_done(t, LIBUSB_TRANSFER_OVERFLOW, 0);
+            continue;
+        }
+        memcpy(t->buffer, r.data, r.len);
+        queue_done(t, LIBUSB_TRANSFER_COMPLETED, r.len);
     }
 }
 
@@ -112,6 +146,27 @@ static void handle_command(const unsigned char *data, int len)
         add_response("DATA%08lx", download_left);
     }
     else if (!strcmp(cmd, "silence")) { /* no response: used to test read timeouts */ }
+    else if (!strcmp(cmd, "big"))
+    {
+        /* a 64 byte packet with a known pattern, for reads smaller than a packet */
+        struct response *r = &responses[response_count++];
+        int i;
+        for (i = 0; i < 64; i++) r->data[i] = 'A' + i % 26;
+        r->len = 64;
+        flog("device response: 64 byte pattern\n");
+    }
+    else if (!strcmp(cmd, "stall"))
+    {
+        /* the IN endpoint halts until the host clears it */
+        halted = 1;
+        while (pending_count)
+        {
+            struct libusb_transfer *t = pending_in[0];
+            memmove(pending_in, pending_in + 1, --pending_count * sizeof(*pending_in));
+            queue_done(t, LIBUSB_TRANSFER_STALL, 0);
+        }
+    }
+    else if (!strcmp(cmd, "unplug")) unplug_requested = 1;
     else if (!strcmp(cmd, "reboot")) add_response("OKAY");
     else add_response("FAILunknown command");
 }
@@ -168,10 +223,28 @@ static const unsigned char composite_config_desc[55] =
     7, LIBUSB_DT_ENDPOINT, EP_OUT, LIBUSB_TRANSFER_TYPE_BULK, MAX_PACKET & 0xff, MAX_PACKET >> 8, 0,
 };
 
+/* fastboot phone whose interface has a second alternate setting that uses
+ * different endpoints */
+static const unsigned char alt_config_desc[55] =
+{
+    9, LIBUSB_DT_CONFIG, 55, 0, 1, 1, 0, 0x80, 250,
+    9, LIBUSB_DT_INTERFACE, 0, 0, 2, 0xff, 0x42, 0x03, 0,
+    7, LIBUSB_DT_ENDPOINT, EP_IN, LIBUSB_TRANSFER_TYPE_BULK, MAX_PACKET & 0xff, MAX_PACKET >> 8, 0,
+    7, LIBUSB_DT_ENDPOINT, EP_OUT, LIBUSB_TRANSFER_TYPE_BULK, MAX_PACKET & 0xff, MAX_PACKET >> 8, 0,
+    9, LIBUSB_DT_INTERFACE, 0, 1, 2, 0xff, 0x42, 0x03, 0,
+    7, LIBUSB_DT_ENDPOINT, 0x82, LIBUSB_TRANSFER_TYPE_BULK, MAX_PACKET & 0xff, MAX_PACKET >> 8, 0,
+    7, LIBUSB_DT_ENDPOINT, 0x02, LIBUSB_TRANSFER_TYPE_BULK, MAX_PACKET & 0xff, MAX_PACKET >> 8, 0,
+};
+
 static int composite(void) { return getenv("FAKEUSB_COMPOSITE") != NULL; }
+static int alt_mode(void) { return getenv("FAKEUSB_ALT") != NULL; }
 #define DEV_DESC (composite() ? composite_device_desc : device_desc)
-#define CFG_DESC (composite() ? composite_config_desc : config_desc)
-#define CFG_LEN  (composite() ? 55 : 32)
+#define CFG_DESC (composite() ? composite_config_desc : alt_mode() ? alt_config_desc : config_desc)
+#define CFG_LEN  (composite() || alt_mode() ? 55 : 32)
+
+/* the endpoints of the alternate setting the host has selected */
+static int ep_in(void) { return alt_mode() && host_alt ? 0x82 : EP_IN; }
+static int ep_out(void) { return alt_mode() && host_alt ? 0x02 : EP_OUT; }
 
 static int string_desc(int index, unsigned char *buf, int max)
 {
@@ -212,6 +285,15 @@ static void handle_control(struct libusb_transfer *t)
         else if (type == LIBUSB_DT_CONFIG) { len = wlength < CFG_LEN ? wlength : CFG_LEN; memcpy(data, CFG_DESC, len); }
         else if (type == LIBUSB_DT_STRING) len = string_desc(index, data, wlength);
     }
+    else if (setup->bmRequestType == 0x01 && setup->bRequest == LIBUSB_REQUEST_SET_INTERFACE && alt_mode())
+    {
+        /* The device accepts the request, but a raw SET_INTERFACE goes
+         * past the host's USB core, which keeps using the endpoints of
+         * the old setting; only libusb_set_interface_alt_setting()
+         * updates it. */
+        flog("device: raw SET_INTERFACE %d, the host side is not updated\n", libusb_le16_to_cpu(setup->wValue));
+        len = 0;
+    }
     else if ((setup->bmRequestType & 0x60) == 0x40) /* vendor */
     {
         if (setup->bmRequestType & 0x80)
@@ -243,6 +325,8 @@ int LIBUSB_CALL libusb_hotplug_register_callback(libusb_context *ctx, int events
         void *user_data, libusb_hotplug_callback_handle *handle)
 {
     flog("hotplug register, flags %#x\n", flags);
+    hotplug_cb = cb_fn;
+    hotplug_data = user_data;
     if (handle) *handle = 1;
     if (flags & LIBUSB_HOTPLUG_ENUMERATE)
         cb_fn(ctx, &fake_dev, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED, user_data);
@@ -291,6 +375,17 @@ void LIBUSB_CALL libusb_free_config_descriptor(struct libusb_config_descriptor *
     free(config);
 }
 
+int LIBUSB_CALL libusb_get_device_speed(libusb_device *dev)
+{
+    const char *speed = getenv("FAKEUSB_SPEED");
+
+    if (!speed) return LIBUSB_SPEED_HIGH;
+    if (!strcmp(speed, "low")) return LIBUSB_SPEED_LOW;
+    if (!strcmp(speed, "full")) return LIBUSB_SPEED_FULL;
+    if (!strcmp(speed, "super")) return LIBUSB_SPEED_SUPER;
+    return LIBUSB_SPEED_HIGH;
+}
+
 uint8_t LIBUSB_CALL libusb_get_bus_number(libusb_device *dev) { return 1; }
 uint8_t LIBUSB_CALL libusb_get_port_number(libusb_device *dev) { return 4; }
 libusb_device * LIBUSB_CALL libusb_get_device(libusb_device_handle *h) { return h->dev; }
@@ -302,12 +397,53 @@ int LIBUSB_CALL libusb_open(libusb_device *dev, libusb_device_handle **handle)
     return 0;
 }
 
-void LIBUSB_CALL libusb_close(libusb_device_handle *handle) { flog("libusb_close\n"); }
+void LIBUSB_CALL libusb_close(libusb_device_handle *handle)
+{
+    pthread_mutex_lock(&lock);
+    if (pending_count || done_count)
+        flog("FAKEUSB ERROR: libusb_close with %d transfer(s) still in flight\n", pending_count + done_count);
+    pthread_mutex_unlock(&lock);
+    flog("libusb_close\n");
+}
 
 int LIBUSB_CALL libusb_clear_halt(libusb_device_handle *handle, unsigned char endpoint)
 {
     flog("clear halt %#x\n", endpoint);
+    pthread_mutex_lock(&lock);
+    if (endpoint & 0x80) halted = 0;
+    pthread_mutex_unlock(&lock);
     return 0;
+}
+
+int LIBUSB_CALL libusb_claim_interface(libusb_device_handle *handle, int iface)
+{
+    flog("claim interface %d\n", iface);
+    pthread_mutex_lock(&lock);
+    claimed |= 1 << iface;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
+int LIBUSB_CALL libusb_release_interface(libusb_device_handle *handle, int iface)
+{
+    pthread_mutex_lock(&lock);
+    claimed &= ~(1 << iface);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+
+int LIBUSB_CALL libusb_set_interface_alt_setting(libusb_device_handle *handle, int iface, int alt)
+{
+    int ret = 0;
+
+    pthread_mutex_lock(&lock);
+    if (gone) ret = LIBUSB_ERROR_NO_DEVICE;
+    else if (!(claimed & (1 << iface))) ret = LIBUSB_ERROR_NOT_FOUND; /* like libusb */
+    else if (iface != 0 || alt < 0 || alt > (alt_mode() ? 1 : 0)) ret = LIBUSB_ERROR_NOT_FOUND;
+    else host_alt = alt;
+    pthread_mutex_unlock(&lock);
+    flog("set interface %d alt setting %d: %d\n", iface, alt, ret);
+    return ret;
 }
 
 struct libusb_transfer * LIBUSB_CALL libusb_alloc_transfer(int iso_packets)
@@ -325,6 +461,11 @@ void LIBUSB_CALL libusb_free_transfer(struct libusb_transfer *t)
 int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *t)
 {
     pthread_mutex_lock(&lock);
+    if (gone)
+    {
+        pthread_mutex_unlock(&lock);
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
     if (getenv("FAKEUSB_FAIL_SUBMIT") && t->type == LIBUSB_TRANSFER_TYPE_BULK && t->endpoint == EP_OUT
             && t->length == 4 && !memcmp(t->buffer, "fail", 4))
     {
@@ -338,21 +479,28 @@ int LIBUSB_CALL libusb_submit_transfer(struct libusb_transfer *t)
             handle_control(t);
             break;
         case LIBUSB_TRANSFER_TYPE_BULK:
-            if (t->endpoint == EP_IN)
+            if (t->endpoint == ep_in())
             {
                 flog("submit IN %d\n", t->length);
+                if (halted)
+                {
+                    queue_done(t, LIBUSB_TRANSFER_STALL, 0);
+                    break;
+                }
                 pending_in[pending_count++] = t;
                 match_in();
             }
-            else if (t->endpoint == EP_OUT)
+            else if (t->endpoint == ep_out())
             {
                 flog("submit OUT %d\n", t->length);
                 handle_out(t);
             }
             else
             {
+                /* usbfs: the endpoint does not exist in the current setting */
+                flog("submit to unknown endpoint %#x\n", t->endpoint);
                 pthread_mutex_unlock(&lock);
-                return LIBUSB_ERROR_INVALID_PARAM;
+                return LIBUSB_ERROR_NOT_FOUND;
             }
             break;
         default:
@@ -372,8 +520,19 @@ int LIBUSB_CALL libusb_cancel_transfer(struct libusb_transfer *t)
     {
         if (pending_in[i] == t)
         {
+            if (gone)
+            {
+                /* the transfer fails with NO_DEVICE once the disconnect is handled */
+                ret = LIBUSB_ERROR_NO_DEVICE;
+                break;
+            }
             memmove(pending_in + i, pending_in + i + 1, (--pending_count - i) * sizeof(*pending_in));
-            queue_done(t, LIBUSB_TRANSFER_CANCELLED, 0);
+            if (getenv("FAKEUSB_CANCEL_COMPLETES") && t->length >= 4)
+            {
+                memcpy(t->buffer, "LATE", 4);
+                queue_done(t, LIBUSB_TRANSFER_COMPLETED, 4);
+            }
+            else queue_done(t, LIBUSB_TRANSFER_CANCELLED, 0);
             ret = 0;
             break;
         }
@@ -383,19 +542,20 @@ int LIBUSB_CALL libusb_cancel_transfer(struct libusb_transfer *t)
     return ret;
 }
 
-int LIBUSB_CALL libusb_handle_events(libusb_context *ctx)
+/* lock must be held */
+static void fail_pending_transfers(void)
 {
-    struct timespec ts;
-
-    pthread_mutex_lock(&lock);
-    if (!done_count && !interrupted)
+    while (pending_count)
     {
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 200 * 1000000;
-        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
-        pthread_cond_timedwait(&cond, &lock, &ts);
+        struct libusb_transfer *t = pending_in[0];
+        memmove(pending_in, pending_in + 1, --pending_count * sizeof(*pending_in));
+        queue_done(t, LIBUSB_TRANSFER_NO_DEVICE, 0);
     }
-    interrupted = 0;
+}
+
+/* lock must be held; it is released around the callbacks */
+static void run_callbacks(void)
+{
     while (done_count)
     {
         struct libusb_transfer *t = done_queue[0];
@@ -405,6 +565,59 @@ int LIBUSB_CALL libusb_handle_events(libusb_context *ctx)
         if (t->flags & LIBUSB_TRANSFER_FREE_TRANSFER)
             libusb_free_transfer(t);
         pthread_mutex_lock(&lock);
+    }
+}
+
+static int time_reached(const struct timespec *when)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    return now.tv_sec > when->tv_sec || (now.tv_sec == when->tv_sec && now.tv_nsec >= when->tv_nsec);
+}
+
+int LIBUSB_CALL libusb_handle_events(libusb_context *ctx)
+{
+    struct timespec ts;
+
+    pthread_mutex_lock(&lock);
+    if (!done_count && !interrupted && !unplug_requested)
+    {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (late_completion ? 20 : 200) * 1000000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&cond, &lock, &ts);
+    }
+    interrupted = 0;
+    run_callbacks();
+
+    if (unplug_requested && !gone)
+    {
+        gone = 1;
+        if (getenv("FAKEUSB_UNPLUG_LATE"))
+        {
+            flog("device unplugged, %d transfer(s) stay pending for now\n", pending_count);
+            late_completion = 1;
+            clock_gettime(CLOCK_REALTIME, &late_time);
+            late_time.tv_nsec += 300 * 1000000;
+            if (late_time.tv_nsec >= 1000000000) { late_time.tv_sec++; late_time.tv_nsec -= 1000000000; }
+        }
+        else
+        {
+            flog("device unplugged, failing %d pending transfer(s)\n", pending_count);
+            fail_pending_transfers();
+            run_callbacks();
+        }
+        pthread_mutex_unlock(&lock);
+        if (hotplug_cb) hotplug_cb(ctx, &fake_dev, LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, hotplug_data);
+        pthread_mutex_lock(&lock);
+    }
+
+    if (late_completion && time_reached(&late_time))
+    {
+        flog("failing %d transfer(s) of the unplugged device\n", pending_count);
+        late_completion = 0;
+        fail_pending_transfers();
+        run_callbacks();
     }
     pthread_mutex_unlock(&lock);
     return 0;

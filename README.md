@@ -19,8 +19,15 @@ lets a Windows program talk to it.
 | File | What it is |
 |---|---|
 | `winusb.sys` (new) | WinUSB function driver. It registers the device interface from `DeviceInterfaceGUIDs`, as native WinUSB does, so `SetupDiGetClassDevs` finds the phone, and it turns WinUSB requests into USB transfers. It handles both single-interface devices (fastboot) and the HDB/ADB interface of composite devices (`&MI_xx`, Huawei normal mode). |
-| `winusb.dll` (replaces the stub) | Full WinUSB API: `Initialize`, `QueryInterfaceSettings`, `QueryPipe(Ex)`, `GetDescriptor`, `ControlTransfer`, `Read/WritePipe` (sync and overlapped), `Abort/Reset/FlushPipe`, pipe and power policies (including `PIPE_TRANSFER_TIMEOUT`), `GetOverlappedResult`, alternate settings and the descriptor parsers. Built for 32-bit (HiSuite) and 64-bit. |
-| `wineusb.sys` + `wineusb.so` (patched) | Per-request cancellation (`CancelIoEx`, timeouts, `AbortPipe` now only aborts the given pipe), generic control transfers, and transfers that libusb refuses now fail cleanly instead of hanging forever. |
+| `winusb.dll` (replaces the stub) | Full WinUSB API: `Initialize`, `QueryInterfaceSettings`, `QueryPipe(Ex)`, `GetDescriptor`, `ControlTransfer`, `Read/WritePipe` (sync and overlapped), `Abort/Reset/FlushPipe`, pipe and power policies, `GetOverlappedResult`, alternate settings and the descriptor parsers. Built for 32-bit (HiSuite) and 64-bit. |
+| `wineusb.sys` + `wineusb.so` (patched) | Per-request cancellation (`CancelIoEx`, timeouts, `AbortPipe` now only aborts the given pipe), generic control transfers, alternate settings, the real device speed, and transfers that libusb refuses now fail cleanly instead of hanging forever. Unplugging a device with transfers in flight no longer completes them twice. |
+
+The pipe policies are applied by the driver, so they work the same for synchronous and overlapped calls:
+
+- `PIPE_TRANSFER_TIMEOUT` ends a transfer with `ERROR_SEM_TIMEOUT`, also when the caller waits on an `OVERLAPPED`.
+- Reads on a pipe are served one at a time and in order, unless `RAW_IO` is set.
+- A read may ask for less than the device sends: the rest of the packet is kept for the next read (`ALLOW_PARTIAL_READS`, the default), dropped (`AUTO_FLUSH`, `WinUsb_FlushPipe`), or the read fails (`ALLOW_PARTIAL_READS` off).
+- `IGNORE_SHORT_PACKETS`, `SHORT_PACKET_TERMINATE` and `AUTO_CLEAR_STALL` behave as documented for WinUSB.
 
 Sources are in `patches/wine-11.22-winusb.patch` (applies to the `wine-11.22` tag). Prebuilt binaries are in `lib/`.
 
@@ -42,6 +49,10 @@ WINEPREFIX=$HOME/.wine ./install.sh --prefix
 Then **unplug and replug the phone**.
 
 Step 1 also installs a udev rule so Wine can open Huawei (`12d1`) and Android (`18d1`) devices.
+It gives access to the user logged in at the screen, and to members of the `plugdev` group
+(for ssh sessions and the like); other accounts on the machine get none.
+
+The original Wine files are kept in a backup directory next to the Wine modules, and `--uninstall` puts them back.
 
 ## Check it before starting HiSuite
 
@@ -92,6 +103,20 @@ sudo FORCE=1 ./install.sh
 WINEPREFIX=$HOME/.wine ./install.sh --prefix
 ```
 
+Installing again after an upgrade is safe: the installer notices that Wine's own files
+have changed and takes a new backup of them, so `--uninstall` never brings back files of the old version.
+
+WineHQ's packages also have 32-bit Unix libraries (`lib/wine/i386-unix`), which 32-bit prefixes
+(`WINEARCH=win32`) use. `build.sh` builds the 32-bit `wineusb.so` for them if a 32-bit toolchain is installed:
+
+```bash
+sudo dpkg --add-architecture i386 && sudo apt update
+sudo apt install gcc-multilib libusb-1.0-0-dev:i386
+```
+
+Without it, the installer leaves the 32-bit drivers alone. 32-bit programs such as HiSuite
+still work in the usual 64-bit prefix; only 32-bit prefixes get no WinUSB.
+
 ## Tests
 
 `tests/run-tests.sh` runs end-to-end tests without hardware. A stand-in
@@ -110,9 +135,19 @@ The tests cover:
 - device discovery through `SetupDi*` and the interface GUID
 - descriptors, string descriptors and vendor control transfers
 - fastboot commands and a 3 MiB download that is checked byte for byte
-- pipe timeouts, `AbortPipe`, `CancelIoEx`, and recovery afterwards
-- failed transfers returning an error instead of hanging
+- pipe timeouts for synchronous and overlapped transfers, `AbortPipe`, `CancelIoEx`, and recovery afterwards
+- failed transfers returning an error, and no data, instead of hanging
+- stalls, with and without `AUTO_CLEAR_STALL`
+- reads smaller than a packet, and the read policies
+- several reads pending on one pipe
+- a device handle that is bound to an I/O completion port
+- alternate settings and the device speed
+- unplugging the device while transfers are in flight, and while they are being cancelled
 - composite devices: only the interface the driver is bound to is exposed
+- a 32-bit prefix, if Wine has 32-bit Unix libraries and `gcc-multilib` is installed
+
+The emulated libusb also checks that the USB stack follows libusb's rules,
+for example that no transfer is left behind when a device is closed.
 
 On stock Wine 11.22 the same setup fails with
 `Failed to load driver L"WinUSB", status 0xc0000142`.

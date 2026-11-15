@@ -2,41 +2,7 @@
  * WinUSB end-to-end test: finds an Android/fastboot device through its
  * device interface (like AdbWinUsbApi / HiSuite do) and talks fastboot to it.
  */
-#include <windows.h>
-#include <setupapi.h>
-#include <winusb.h>
-#include <stdio.h>
-#include <string.h>
-
-static const GUID android_guid = {0xf72fe0d4, 0xcbcb, 0x407d, {0x88, 0x14, 0x9e, 0xd6, 0x73, 0xd0, 0xdd, 0x6b}};
-
-static int failures;
-#define CHECK(cond, ...) do { if (cond) printf("PASS: " __VA_ARGS__); else { failures++; printf("FAIL: " __VA_ARGS__); } printf("\n"); } while (0)
-
-static BOOL find_device(char *path, DWORD size)
-{
-    SP_DEVICE_INTERFACE_DATA iface = {sizeof(iface)};
-    SP_DEVICE_INTERFACE_DETAIL_DATA_A *detail;
-    HDEVINFO set;
-    char buffer[1024];
-    BOOL found = FALSE;
-
-    set = SetupDiGetClassDevsA(&android_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (set == INVALID_HANDLE_VALUE) return FALSE;
-
-    if (SetupDiEnumDeviceInterfaces(set, NULL, &android_guid, 0, &iface))
-    {
-        detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)buffer;
-        detail->cbSize = sizeof(*detail);
-        if (SetupDiGetDeviceInterfaceDetailA(set, &iface, detail, sizeof(buffer), NULL, NULL))
-        {
-            lstrcpynA(path, detail->DevicePath, size);
-            found = TRUE;
-        }
-    }
-    SetupDiDestroyDeviceInfoList(set);
-    return found;
-}
+#include "common.h"
 
 static BOOL fb_command(WINUSB_INTERFACE_HANDLE h, UCHAR out, UCHAR in, const char *cmd, char *reply)
 {
@@ -73,12 +39,11 @@ int main(void)
 
     printf("== WinUSB end-to-end test (%d-bit) ==\n", (int)sizeof(void *) * 8);
 
-    for (i = 0; i < 100 && !find_device(path, sizeof(path)); i++) Sleep(100);
-    CHECK(i < 100, "device interface {F72FE0D4-...} found via SetupDi: %s", i < 100 ? path : "(none)");
-    if (i == 100) return 1;
+    ret = wait_for_device(path, sizeof(path));
+    CHECK(ret, "device interface {F72FE0D4-...} found via SetupDi: %s", ret ? path : "(none)");
+    if (!ret) return 1;
 
-    file = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
+    file = open_device(path);
     CHECK(file != INVALID_HANDLE_VALUE, "CreateFile on device path (error %lu)", GetLastError());
     if (file == INVALID_HANDLE_VALUE) return 1;
 

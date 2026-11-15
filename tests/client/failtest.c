@@ -12,10 +12,11 @@ int main(void)
     d->cbSize = sizeof(*d); SetupDiGetDeviceInterfaceDetailA(s, &i, d, sizeof(b), NULL, NULL);
     f = CreateFileA(d->DevicePath, GENERIC_READ|GENERIC_WRITE, 3, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
     if (!WinUsb_Initialize(f, &h)) { printf("FAIL: init %lu\n", GetLastError()); return 1; }
-    t = GetTickCount();
+    t = GetTickCount(); len = 0xdead;
     ok = WinUsb_WritePipe(h, 0x01, (UCHAR *)"fail", 4, &len, NULL);
     printf("%s: failed submission returns error instead of hanging (ret %d, error %lu, %lu ms)\n",
            !ok && GetTickCount() - t < 2000 ? "PASS" : "FAIL", ok, GetLastError(), GetTickCount() - t);
+    printf("%s: no bytes are reported as transferred (%lu)\n", !len ? "PASS" : "FAIL", len);
     WinUsb_WritePipe(h, 0x01, (UCHAR *)"getvar:version", 14, &len, NULL);
     ok = WinUsb_ReadPipe(h, 0x81, (UCHAR *)r, 64, &len, NULL); r[ok ? len : 0] = 0;
     printf("%s: device usable afterwards (%s)\n", ok && !strcmp(r, "OKAY0.4") ? "PASS" : "FAIL", r);

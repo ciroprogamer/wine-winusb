@@ -162,5 +162,6 @@ int main(int argc, char **argv)
 
     printf("\n%d interface(s) found, %d opened with WinUSB%s\n", found, opened,
             worked ? ", I/O working" : "");
+    if (roundtrip && !worked) return 1;
     return opened ? 0 : 1;
 }

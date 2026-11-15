@@ -10,6 +10,9 @@
 # Environment:
 #   WINE_DIR   Wine installation root (default: derived from `wine` in PATH, e.g. /opt/wine-staging)
 #   FORCE=1    install even if the Wine version is not 11.22
+#
+# The original files are kept in <wine lib dir>/.winusb-backup, together with
+# a record of what was installed. After a Wine upgrade, just install again.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,15 +30,27 @@ find_wine_dir() {
     dirname "$(dirname "$wine_bin")"
 }
 
-lib_dir() {
-    local root="$1"
-    for d in "$root/lib/wine" "$root/lib64/wine" "$root/lib/x86_64-linux-gnu/wine"; do
-        [ -d "$d/x86_64-windows" ] && { echo "$d"; return; }
+# Path of a module in the Wine installation; empty if Wine doesn't have
+# that architecture. Depending on how Wine was packaged, the 32-bit and
+# 64-bit modules are not always in the same directory.
+target_path() {
+    local root="$1" f="$2" d
+    for d in "$root/lib/wine" "$root/lib64/wine" "$root/lib32/wine" \
+             "$root/lib/x86_64-linux-gnu/wine" "$root/lib/i386-linux-gnu/wine"; do
+        [ -d "$d/${f%%/*}" ] && { echo "$d/$f"; return; }
     done
-    die "could not find x86_64-windows directory under $root"
+    return 0
 }
 
-# file in package -> path relative to the wine lib dir
+# The backup lives next to the 64-bit Windows modules.
+backup_dir() {
+    local root="$1" t
+    t="$(target_path "$root" "x86_64-windows/winusb.dll")"
+    [ -n "$t" ] || die "could not find the x86_64-windows directory under $root"
+    echo "$(dirname "$(dirname "$t")")/.winusb-backup"
+}
+
+# file in package -> path relative to a wine lib dir
 FILES=(
     "x86_64-windows/winusb.dll"
     "i386-windows/winusb.dll"
@@ -44,37 +59,95 @@ FILES=(
     "x86_64-windows/wineusb.sys"
     "i386-windows/wineusb.sys"
     "x86_64-unix/wineusb.so"
+    "i386-unix/wineusb.so"
 )
+
+checksum() { sha256sum "$1" | cut -d' ' -f1; }
+
+# Is the file in the Wine installation one that this script put there? A
+# Wine upgrade replaces our files with new original ones, which must
+# neither be mistaken for ours nor be overwritten with an old backup.
+is_ours() {
+    local backup="$1" f="$2" target="$3" recorded
+    [ -e "$target" ] || return 1
+    recorded="$(awk -v f="$f" '$2 == f { print $1 }' "$backup/INSTALLED" 2>/dev/null || true)"
+    if [ -n "$recorded" ]; then
+        [ "$(checksum "$target")" = "$recorded" ]
+        return
+    fi
+    # Installed by an earlier version of this script, which kept no record:
+    # tell by something that only our modules contain.
+    case "$f" in
+        */winusb.dll)  grep -q "is winusb.sys loaded for this device" "$target" ;;
+        */winusb.sys)  grep -q "No DeviceInterfaceGUIDs found" "$target" ;;
+        */wineusb.sys) grep -q "IRP %p was already cancelled" "$target" ;;
+        */wineusb.so)  grep -q "Cancelling transfer %p for IRP %p" "$target" ;;
+        *) return 1 ;;
+    esac
+}
+
+is_new_file() { grep -qxF "$2" "$1/NEW_FILES" 2>/dev/null; }
+
+forget_new_file() {
+    [ -f "$1/NEW_FILES" ] || return 0
+    grep -vxF "$2" "$1/NEW_FILES" > "$1/NEW_FILES.tmp" || true
+    mv "$1/NEW_FILES.tmp" "$1/NEW_FILES"
+}
+
+record_installed() {
+    local backup="$1" f="$2" target="$3"
+    if [ -f "$backup/INSTALLED" ]; then
+        awk -v f="$f" '$2 != f' "$backup/INSTALLED" > "$backup/INSTALLED.tmp"
+        mv "$backup/INSTALLED.tmp" "$backup/INSTALLED"
+    fi
+    echo "$(checksum "$target")  $f" >> "$backup/INSTALLED"
+}
 
 do_install() {
     [ "$(id -u)" = 0 ] || die "installing into the Wine directory needs root: sudo $0"
-    local root libdir version backup
+    local root backup version f target skip_i386_drivers=0
     root="$(find_wine_dir)"
-    libdir="$(lib_dir "$root")"
+    backup="$(backup_dir "$root")"
     version="$("$root/bin/wine" --version 2>/dev/null || true)"
     info "Wine: $root ($version)"
     if [[ "$version" != "$EXPECTED_VERSION"* ]] && [ "${FORCE:-0}" != 1 ]; then
         die "these binaries were built for $EXPECTED_VERSION, found '$version' (FORCE=1 to override)"
     fi
 
-    backup="$libdir/.winusb-backup"
-    if [ ! -d "$backup" ]; then
-        info "Backing up original files to $backup"
-        mkdir -p "$backup"
-        for f in "${FILES[@]}"; do
-            if [ -e "$libdir/$f" ]; then
-                mkdir -p "$backup/$(dirname "$f")"
-                cp -a "$libdir/$f" "$backup/$f"
-            else
-                echo "$f" >> "$backup/NEW_FILES"
-            fi
-        done
+    # wineusb.sys only works with the wineusb.so it was built with. If this
+    # Wine has 32-bit Unix libraries and the package has none, the 32-bit
+    # drivers stay as they are; they are only used by 32-bit prefixes.
+    if [ -n "$(target_path "$root" "i386-unix/wineusb.so")" ] && [ ! -e "$HERE/lib/i386-unix/wineusb.so" ]; then
+        skip_i386_drivers=1
+        info "warning: lib/i386-unix/wineusb.so is missing (see build.sh); leaving the 32-bit drivers alone."
+        info "         32-bit programs work in 64-bit prefixes, but 32-bit prefixes (WINEARCH=win32) get no WinUSB."
     fi
 
+    mkdir -p "$backup"
     for f in "${FILES[@]}"; do
-        [ -d "$libdir/$(dirname "$f")" ] || { info "skipping $f (no $(dirname "$f") directory)"; continue; }
-        install -m 0644 "$HERE/lib/$f" "$libdir/$f"
-        [[ "$f" == *.so ]] && chmod 0755 "$libdir/$f"
+        target="$(target_path "$root" "$f")"
+        [ -n "$target" ] || { info "skipping $f (no ${f%%/*} directory)"; continue; }
+        [ -e "$HERE/lib/$f" ] || { info "skipping $f (not in this package)"; continue; }
+        case "$f" in
+            i386-windows/*.sys) [ $skip_i386_drivers = 0 ] || { info "skipping $f"; continue; } ;;
+        esac
+
+        if [ ! -e "$target" ]; then
+            # Wine has no such file; uninstalling removes ours again
+            rm -f "$backup/$f"
+            is_new_file "$backup" "$f" || echo "$f" >> "$backup/NEW_FILES"
+        elif ! is_ours "$backup" "$f" "$target"; then
+            # an original file: from the first installation, or from a
+            # Wine upgrade since the last one
+            mkdir -p "$backup/$(dirname "$f")"
+            cp -a "$target" "$backup/$f"
+            forget_new_file "$backup" "$f"
+            info "backed up $f"
+        fi
+
+        install -m 0644 "$HERE/lib/$f" "$target"
+        [[ "$f" == *.so ]] && chmod 0755 "$target"
+        record_installed "$backup" "$f" "$target"
         info "installed $f"
     done
 
@@ -92,21 +165,31 @@ do_install() {
 
 do_uninstall() {
     [ "$(id -u)" = 0 ] || die "needs root: sudo $0 --uninstall"
-    local root libdir backup
+    local root backup f target
     root="$(find_wine_dir)"
-    libdir="$(lib_dir "$root")"
-    backup="$libdir/.winusb-backup"
+    backup="$(backup_dir "$root")"
     [ -d "$backup" ] || die "no backup found in $backup"
     for f in "${FILES[@]}"; do
-        if [ -e "$backup/$f" ]; then
-            cp -a "$backup/$f" "$libdir/$f"; info "restored $f"
-        elif grep -qx "$f" "$backup/NEW_FILES" 2>/dev/null; then
-            rm -f "$libdir/$f"; info "removed $f"
+        target="$(target_path "$root" "$f")"
+        [ -n "$target" ] && [ -e "$target" ] || continue
+        if ! is_ours "$backup" "$f" "$target"; then
+            info "leaving $f alone: it has been replaced since the installation (Wine upgrade?)"
+        elif [ -e "$backup/$f" ]; then
+            cp -a "$backup/$f" "$target"; info "restored $f"
+        elif is_new_file "$backup" "$f"; then
+            rm -f "$target"; info "removed $f"
         fi
     done
     rm -rf "$backup"
-    rm -f /etc/udev/rules.d/51-android-wine.rules
+    if cmp -s "$HERE/51-android-wine.rules" /etc/udev/rules.d/51-android-wine.rules; then
+        rm -f /etc/udev/rules.d/51-android-wine.rules
+        udevadm control --reload-rules 2>/dev/null || true
+    fi
     info "Original Wine files restored."
+}
+
+reg_add() {
+    wine reg add "$@" /f >/dev/null 2>&1 || die "could not write $1 to the registry of $WINEPREFIX"
 }
 
 do_prefix() {
@@ -137,16 +220,15 @@ do_prefix() {
 
     # Make sure both the driver and the dll are always Wine's builtin ones,
     # even if an application ships its own winusb.dll.
-    wine reg add 'HKCU\Software\Wine\DllOverrides' /v winusb /d builtin /f >/dev/null 2>&1
-    wine reg add 'HKCU\Software\Wine\DllOverrides' /v winusb.sys /d builtin /f >/dev/null 2>&1
+    reg_add 'HKCU\Software\Wine\DllOverrides' /v winusb /d builtin
+    reg_add 'HKCU\Software\Wine\DllOverrides' /v winusb.sys /d builtin
 
     # The WinUSB service (created by Android/HiSuite driver INFs) must point
     # at the driver; create it if no INF did.
-    wine reg add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v ImagePath /t REG_EXPAND_SZ /d 'C:\windows\system32\drivers\winusb.sys' /f >/dev/null 2>&1
-    wine reg add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v Type /t REG_DWORD /d 1 /f >/dev/null 2>&1
-    wine reg add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v Start /t REG_DWORD /d 3 /f >/dev/null 2>&1
-    wine reg add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v ErrorControl /t REG_DWORD /d 1 /f >/dev/null 2>&1
-
+    reg_add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v ImagePath /t REG_EXPAND_SZ /d 'C:\windows\system32\drivers\winusb.sys'
+    reg_add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v Type /t REG_DWORD /d 1
+    reg_add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v Start /t REG_DWORD /d 3
+    reg_add 'HKLM\System\CurrentControlSet\Services\WinUSB' /v ErrorControl /t REG_DWORD /d 1
 
     wineserver -k 2>/dev/null || true
 

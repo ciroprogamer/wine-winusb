@@ -1,5 +1,9 @@
 # Let Wine (libusb) open Huawei phones and Android fastboot/adb devices.
+#
+# The user at the screen gets access through "uaccess"; for other sessions
+# (ssh, system services) add the user to the plugdev group. The devices are
+# not opened up to every account on the machine.
 # Huawei / Honor
-SUBSYSTEM=="usb", ATTR{idVendor}=="12d1", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="12d1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
 # Google vendor ID, used by fastboot mode (18d1:d00d) and many adb devices
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="18d1", MODE="0660", GROUP="plugdev", TAG+="uaccess"
