@@ -1,0 +1,36 @@
+; Minimal WinUSB driver INF for the emulated test devices.
+[Version]
+Signature   = "$Windows NT$"
+Class       = AndroidUsbDeviceClass
+ClassGuid   = {3F966BD9-FA04-4ec5-991C-D326973B5128}
+Provider    = %Provider%
+DriverVer   = 11/15/2026,1.0.0.0
+
+[Manufacturer]
+%Provider% = Devices, NTamd64
+
+[Devices.NTamd64]
+%Fastboot% = USB_Install, USB\VID_18D1&PID_D00D
+%Hdb%      = USB_Install, USB\VID_12D1&PID_1052&MI_01
+
+[USB_Install]
+
+[USB_Install.Services]
+AddService = WinUSB, 0x00000002, WinUSB_ServiceInstall
+
+[WinUSB_ServiceInstall]
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %12%\winusb.sys
+
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{F72FE0D4-CBCB-407d-8814-9ED673D0DD6B}"
+
+[Strings]
+Provider = "wine-winusb tests"
+Fastboot = "Test Fastboot Interface"
+Hdb      = "Test HDB Interface"
